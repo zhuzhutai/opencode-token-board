@@ -1,0 +1,41 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+*.tsbuildinfo
+
+# 编辑器 / IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 环境变量与密钥
+.env
+.env.local
+.env.*.local
+
+# 日志与运行时数据
+*.log
+npm-debug.log*
+tokenwatch-*.json
+tokenwatch-*.csv
+tokenwatch-*.html
+tokenwatch-*.md
+tokenwatch-stats.json
+tokenwatch.jsonl
+
+# opencode 本地配置
+.opencode/
+.worktrees/
+
+# 本地 agent 工具目录
+.mimocode/
+
+# 临时文件
+img.png

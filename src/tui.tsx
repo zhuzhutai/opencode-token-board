@@ -1,0 +1,248 @@
+/** @jsxImportSource @opentui/solid */
+import { createSignal, createEffect, onCleanup } from "solid-js"
+import type { TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { readFileSync } from "node:fs"
+import { registerCommands } from "./commands.js"
+import { createPerfTracker } from "./perf-tracker.js"
+import { createGoUsageFetcher } from "./go-usage.js"
+import type { GoUsageFetcher } from "./go-usage.js"
+import { TokenWatchPanel } from "./sidebar.js"
+
+export interface TokenMessage {
+  id: string
+  sessionID: string
+  providerID: string
+  modelID: string
+  inputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+}
+
+function kvKey(sessionID: string): string {
+  return "tokenwatch-msgs-" + sessionID
+}
+
+const tui: TuiPluginModule["tui"] = async (api) => {
+  const perfTracker = createPerfTracker()
+  const goUsageFetcher: GoUsageFetcher = createGoUsageFetcher()
+  const [sidebarRevision, setSidebarRevision] = createSignal(0)
+  const [allTokenMessages, setAllTokenMessages] = createSignal<TokenMessage[]>([])
+  let currentSlotSessionID = ""
+  const cleanups: (() => void)[] = []
+
+  registerCommands(api)
+
+  function loadGoConfig(): void {
+    try {
+      const cfg = api.kv?.get?.("tokenwatch-config") as { go?: { workspaceID?: string; cookie?: string } } | undefined
+      if (cfg?.go?.workspaceID && cfg?.go?.cookie) {
+        goUsageFetcher.setConfig(cfg.go.workspaceID, cfg.go.cookie)
+        return
+      }
+    } catch { /* 忽略，尝试 fallback */ }
+    // 复用 opencode-go-usage 插件的配置，避免重复填 Cookie
+    try {
+      const cfgFile = join(homedir(), ".config", "opencode", "opencode-go-usage.json")
+      const raw = JSON.parse(readFileSync(cfgFile, "utf-8")) as { workspaceId?: string; authCookie?: string }
+      if (raw?.workspaceId && raw?.authCookie) {
+        goUsageFetcher.setConfig(raw.workspaceId, raw.authCookie)
+      }
+    } catch { /* 无配置文件则不启用 */ }
+  }
+  loadGoConfig()
+
+  function persistToKv(sessionID: string, msgs: TokenMessage[]): void {
+    try {
+      api.kv?.set?.(kvKey(sessionID), msgs)
+    } catch { /* non-critical */ }
+  }
+
+  const unsubMsgUpdated = api.event.on("message.updated", (event: any) => {
+    const info = event.properties?.info
+
+    perfTracker.handleMessageUpdated(event)
+
+    // 一轮会话结束（assistant 消息完成且有有效 token）→ 刷新 Go 用量
+    if (info?.role === "assistant" && (info?.tokens?.total ?? 0) > 0 && info?.time?.completed) {
+      goUsageFetcher.refresh()
+    }
+
+    if (info?.role === "assistant" && info?.tokens?.total > 0) {
+      setAllTokenMessages(prev => {
+        const msg: TokenMessage = {
+          id: info.id,
+          sessionID: info.sessionID ?? "",
+          providerID: info.providerID ?? "unknown",
+          modelID: info.modelID ?? "unknown",
+          inputTokens: info.tokens?.input ?? 0,
+          outputTokens: info.tokens?.output ?? 0,
+          reasoningTokens: info.tokens?.reasoning ?? 0,
+          cacheRead: info.tokens?.cache?.read ?? 0,
+          cacheWrite: info.tokens?.cache?.write ?? 0,
+          cost: info.cost ?? 0,
+        }
+        const idx = prev.findIndex(m => m.id === msg.id)
+        let next: TokenMessage[]
+        if (idx >= 0) {
+          next = [...prev]
+          next[idx] = msg
+        } else {
+          next = [...prev, msg]
+        }
+        // Bug fix: 优先使用事件自带的 sessionID，而非 currentSlotSessionID
+        // currentSlotSessionID 在 slot 首次渲染时才更新，session 切换瞬间可能落后
+        const targetSessionID = info.sessionID ?? currentSlotSessionID
+        persistToKv(targetSessionID, next)
+        return next
+      })
+    }
+
+
+    setSidebarRevision((v) => v + 1)
+  })
+  cleanups.push(unsubMsgUpdated)
+
+  const unsubPartUpdated = api.event.on("message.part.updated", (event: any) => {
+    perfTracker.handlePartUpdated({
+      message_id: event.properties?.part?.messageID,
+      type: event.properties?.part?.type,
+      text: event.properties?.part?.type === "text" ? event.properties?.part?.text : undefined,
+      time: { start: event.properties?.part?.time?.start },
+    })
+  })
+  cleanups.push(unsubPartUpdated)
+
+  const unsubRemoved = api.event.on("message.removed", () => {
+    setSidebarRevision((v) => v + 1)
+  })
+  cleanups.push(unsubRemoved)
+
+  // 会话整段空闲 → 刷新 Go 用量
+  const unsubSessionIdle = api.event.on("session.idle", () => {
+    goUsageFetcher.refresh(true)
+  })
+  cleanups.push(unsubSessionIdle)
+
+  api.lifecycle?.onDispose?.(() => {
+    for (const cleanup of cleanups) cleanup()
+  })
+
+  api.slots.register({
+    order: 50,
+    slots: {
+      sidebar_content: (_ctx, { session_id }) => {
+        sidebarRevision()
+
+        if (session_id && session_id !== currentSlotSessionID) {
+          currentSlotSessionID = session_id
+          perfTracker.loadSession(session_id)
+
+          let loaded: TokenMessage[] = []
+          try {
+            const saved = api.kv?.get?.(kvKey(session_id)) as TokenMessage[] | undefined
+            if (saved && saved.length > 0) loaded = saved
+          } catch {}
+          setAllTokenMessages(loaded)
+        }
+
+        // 引入 createEffect 监听历史会话消息在后台异步加载完毕后的变化
+        // 由于历史会话加载可能是异步的，初次检查 messages 可能为空且底层并非响应式数据源，
+        // 故采用短期高频轮询，直到数据加载完成或超时。
+        createEffect(() => {
+          if (!session_id) return
+
+          let timer: any = null
+          let pollCount = 0
+          const maxPolls = 50 // 最多轮询 10 秒 (50 * 200ms)
+
+          const checkAndPopulate = () => {
+            const existing = api.state.session.messages(session_id)
+            if (!existing || existing.length === 0) return false
+
+            setAllTokenMessages((prev) => {
+              let changed = false
+              const next = [...prev]
+              for (const msg of existing) {
+                if ((msg as any).role !== "assistant") continue
+                const tokens = (msg as any).tokens
+                // 与 message.updated 处理器保持一致：过滤 total=0 的失败请求
+                if (!tokens || (tokens.total ?? 0) === 0) continue
+
+                const id = (msg as any).id
+                const idx = next.findIndex(m => m.id === id)
+                const tokenMsg: TokenMessage = {
+                  id,
+                  sessionID: session_id,
+                  providerID: (msg as any).providerID ?? "unknown",
+                  modelID: (msg as any).modelID ?? "unknown",
+                  inputTokens: tokens?.input ?? 0,
+                  outputTokens: tokens?.output ?? 0,
+                  reasoningTokens: tokens?.reasoning ?? 0,
+                  cacheRead: tokens?.cache?.read ?? 0,
+                  cacheWrite: tokens?.cache?.write ?? 0,
+                  cost: (msg as any).cost ?? 0,
+                }
+
+                if (idx >= 0) {
+                  const cur = next[idx]
+                  if (
+                    cur.inputTokens !== tokenMsg.inputTokens ||
+                    cur.outputTokens !== tokenMsg.outputTokens ||
+                    cur.reasoningTokens !== tokenMsg.reasoningTokens ||
+                    cur.cacheRead !== tokenMsg.cacheRead ||
+                    cur.cacheWrite !== tokenMsg.cacheWrite ||
+                    cur.cost !== tokenMsg.cost
+                  ) {
+                    next[idx] = tokenMsg
+                    changed = true
+                  }
+                } else {
+                  next.push(tokenMsg)
+                  changed = true
+                }
+              }
+
+              if (changed) {
+                persistToKv(session_id, next)
+                return next
+              }
+              return prev
+            })
+            return true
+          }
+
+          const hasMessages = checkAndPopulate()
+          if (!hasMessages) {
+            timer = setInterval(() => {
+              pollCount++
+              if (checkAndPopulate() || pollCount >= maxPolls) {
+                clearInterval(timer)
+                timer = null
+              }
+            }, 200)
+          }
+
+          onCleanup(() => {
+            if (timer) {
+              clearInterval(timer)
+            }
+          })
+        })
+
+        return <TokenWatchPanel api={api} theme={api.theme} perfTracker={perfTracker} messages={() => api.state.session.messages(session_id)} allTokenMessages={allTokenMessages} goUsageFetcher={goUsageFetcher} />
+      },
+    },
+  })
+}
+
+const plugin: TuiPluginModule & { id: string } = {
+  id: "opencode-token-board",
+  tui,
+}
+
+export default plugin
