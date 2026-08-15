@@ -1,11 +1,15 @@
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { unlinkSync, writeFileSync } from "node:fs"
 
 /**
  * Windows 桌面提示。
  *
  * 不使用 ToastNotificationManager：传统 Node/PowerShell 进程没有注册 AUMID 时，
  * WinRT 的 Show() 可能静默成功但用户看不到任何通知。这里使用 WinForms 创建
- * 一个真正位于屏幕右下角的顶层小窗，权限按钮直接写入本地批准标记。
+ * 一个真正位于屏幕右下角的顶层矩形小窗，权限按钮直接写入本地批准标记。
  */
 
 function psQuote(value: string): string {
@@ -30,45 +34,54 @@ function runPowerShell(script: string): void {
   ].join("\n")
   const encoded = Buffer.from(wrapped, "utf16le").toString("base64")
   try {
-    // 通过 cmd start 脱离 OpenCode/Bun 的控制台创建标志；直接 spawn GUI 子进程时，
-    // Windows 可能继承无窗口标志，导致 PowerShell 活着但 WinForms 没有可见句柄。
-    const child = spawn("cmd.exe", [
-      "/d",
-      "/c",
-      "start",
-      "",
-      "powershell.exe",
-      "-NoProfile",
-      "-NonInteractive",
-      "-STA",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-EncodedCommand",
-      encoded,
-    ], {
-      // 隐藏的是短暂的 cmd 启动器，不是它启动的 WinForms PowerShell。
+    // wscript 的 WshShell.Run 使用 ShellExecute 创建独立 GUI 进程。
+    // Node/Bun 直接 CreateProcess 或 cmd start 可能让 WinForms 继承无窗口标志。
+    const vbsPath = join(tmpdir(), `opencode-token-board-${randomUUID()}.vbs`)
+    const command = `powershell.exe -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -EncodedCommand ${encoded}`
+    const vbs = [
+      'Set shell = CreateObject("WScript.Shell")',
+      `shell.Run "${command}", 0, False`,
+      'Set fso = CreateObject("Scripting.FileSystemObject")',
+      'On Error Resume Next',
+      'fso.DeleteFile WScript.ScriptFullName, True',
+    ].join("\r\n")
+    writeFileSync(vbsPath, vbs, "ascii")
+    const child = spawn("wscript.exe", [vbsPath], {
       windowsHide: true,
       detached: true,
       stdio: "ignore",
     })
     child.unref()
+    setTimeout(() => {
+      try { unlinkSync(vbsPath) } catch { }
+    }, 5000).unref()
   } catch {
     /* 桌面提示失败不影响插件主流程 */
   }
 }
 
-function popupScript(title: string, message: string, timeoutMs: number, buttons?: Array<{ label: string; reply: string }>, requestID?: string, processID?: number): string {
+export function popupScript(title: string, message: string, timeoutMs: number, buttons?: Array<{ label: string; reply: string; color: string; hover: string }>, requestID?: string, processID?: number): string {
+  const W = 520
   const buttonScript = buttons?.length
     ? buttons.map((button, index) => {
-      const x = 18 + index * 136
+      const x = 18 + index * 168
       return [
         `$button${index} = New-Object System.Windows.Forms.Button`,
         `$button${index}.Text = ${psQuote(button.label)}`,
-        `$button${index}.Width = 122`,
-        `$button${index}.Height = 30`,
-        `$button${index}.Location = New-Object System.Drawing.Point(${x}, 105)`,
+        `$button${index}.Left = ${x}`,
+        `$button${index}.Top = 160`,
+        `$button${index}.Width = 150`,
+        `$button${index}.Height = 38`,
+        "$button" + index + ".FlatStyle = [System.Windows.Forms.FlatStyle]::Flat",
+        "$button" + index + ".FlatAppearance.BorderSize = 0",
+        `$button${index}.BackColor = [System.Drawing.ColorTranslator]::FromHtml(${psQuote(button.color)})`,
+        `$button${index}.FlatAppearance.MouseOverBackColor = [System.Drawing.ColorTranslator]::FromHtml(${psQuote(button.hover)})`,
+        "$button" + index + ".ForeColor = [System.Drawing.Color]::White",
+        `$button${index}.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)`,
+        "$button" + index + ".Cursor = [System.Windows.Forms.Cursors]::Hand",
         `$button${index}.Add_Click({ Complete ${psQuote(button.reply)} })`,
         `$form.Controls.Add($button${index})`,
+        `$button${index}.BringToFront()`,
       ].join("\n")
     }).join("\n")
     : ""
@@ -93,7 +106,7 @@ function Complete([string]$reply) {
 `
     : ""
 
-  const height = buttons?.length ? 180 : 125
+  const height = buttons?.length ? 220 : 158
   const timer = timeoutMs > 0
     ? `
 $timer = New-Object System.Windows.Forms.Timer
@@ -106,25 +119,51 @@ $timer.Start()
   return [
     "Add-Type -AssemblyName System.Windows.Forms",
     "Add-Type -AssemblyName System.Drawing",
-    `$form = New-Object System.Windows.Forms.Form`,
+    "$form = New-Object System.Windows.Forms.Form",
     `$form.Text = ${psQuote(title)}`,
-    `$form.Width = 460`,
+    `$form.Width = ${W}`,
     `$form.Height = ${height}`,
-    "$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle",
-    "$form.MaximizeBox = $false",
-    "$form.MinimizeBox = $false",
-    "$form.TopMost = $true",
+    // 无系统标题栏，避免出现 Windows XP 风格；ShowInTaskbar 保持 true，确保
+    // PowerShell 分离进程中的窗体仍然拥有可见窗口句柄。
+    "$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None",
     "$form.ShowInTaskbar = $true",
+    "$form.TopMost = $true",
+    "$form.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#F5F7FA')",
     "$workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea",
     "$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual",
-    "$form.Location = New-Object System.Drawing.Point(($workArea.Right - $form.Width - 12), ($workArea.Bottom - $form.Height - 12))",
-    "$label = New-Object System.Windows.Forms.Label",
-    "$label.Text = " + psQuote(message),
-    "$label.AutoSize = $false",
-    "$label.Width = 424",
-    "$label.Height = 64",
-    "$label.Location = New-Object System.Drawing.Point(18, 18)",
+    "$form.Location = New-Object System.Drawing.Point(($workArea.Right - $form.Width - 16), ($workArea.Bottom - $form.Height - 16))",
+    "$titleLabel = New-Object System.Windows.Forms.Label",
+    `$titleLabel.Text = ${psQuote(title)}`,
+    "$titleLabel.Left = 22",
+    "$titleLabel.Top = 20",
+    "$titleLabel.Width = 446",
+    "$titleLabel.Height = 26",
+    "$titleLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)",
+    "$titleLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#1F2933')",
+    "$titleLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft",
+    "$form.Controls.Add($titleLabel)",
+    "$closeLabel = New-Object System.Windows.Forms.Label",
+    "$closeLabel.Text = '×'",
+    `$closeLabel.Left = ${W - 44}`,
+    "$closeLabel.Top = 12",
+    "$closeLabel.Width = 30",
+    "$closeLabel.Height = 30",
+    "$closeLabel.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 14)",
+    "$closeLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#667085')",
+    "$closeLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter",
+    "$closeLabel.Cursor = [System.Windows.Forms.Cursors]::Hand",
+    "$closeLabel.Add_Click({ $form.Close() })",
+    "$form.Controls.Add($closeLabel)",
+    `$label = New-Object System.Windows.Forms.Label`,
+    `$label.Text = ${psQuote(message)}`,
+    "$label.Left = 22",
+    "$label.Top = 58",
+    "$label.Width = 476",
+    `$label.Height = ${buttons?.length ? 82 : 70}`,
     "$label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)",
+    "$label.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#3E4C59')",
+    "$label.TextAlign = [System.Drawing.ContentAlignment]::TopLeft",
+    "$label.AutoEllipsis = $true",
     "$form.Controls.Add($label)",
     completion,
     buttonScript,
@@ -166,9 +205,9 @@ export function notifyPermissionWindows(input: PermissionToastInput): void {
     input.message,
     120000,
     [
-      { label: input.allowOnceLabel, reply: "once" },
-      { label: input.alwaysLabel, reply: "always" },
-      { label: input.rejectLabel, reply: "reject" },
+      { label: input.allowOnceLabel, reply: "once", color: "#2E7D32", hover: "#388E3C" },
+      { label: input.alwaysLabel, reply: "always", color: "#1565C0", hover: "#1976D2" },
+      { label: input.rejectLabel, reply: "reject", color: "#C62828", hover: "#D32F2F" },
     ],
     input.requestID,
     input.pid,

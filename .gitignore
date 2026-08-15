@@ -39,3 +39,5 @@ tokenwatch.jsonl
 
 # 临时文件
 img.png
+scripts/test-popup-built.mjs
+scripts/popup-script-check.ps1
