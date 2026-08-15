@@ -1,8 +1,20 @@
 # opencode-token-board
 
-OpenCode CLI 的实时 Token 统计面板，同时支持 Mimo Code。
+> **OpenCode CLI 实时 Token 统计面板 · 同时支持 Mimo Code**
+> Real-time token usage & performance dashboard plugin for OpenCode CLI and Mimo Code.
 
-本项目基于 [opencode-token-watch](https://github.com/Howardzhangdqs/opencode-token-watch) 修改而来，特此鸣谢原项目作者。
+一个运行在 OpenCode TUI 侧边栏的实时面板,让你**亲眼看见**每次对话的 Token 消耗、缓存命中率与响应性能:
+A live sidebar dashboard for the OpenCode TUI that lets you **see** your token consumption, cache hit rate and response performance in real time:
+
+- 📊 **实时 Token 统计** — 输入/输出/推理 Token、成本,随对话滚动更新 / Real-time input/output/reasoning tokens & cost
+- ⚡ **缓存命中率** — 上下文缓存命中可视化,帮你判断 prompt 复用效果 / Visual cache-hit rate to gauge prompt reuse
+- 🚀 **性能指标** — TTFT / TPS / 延迟,追踪模型响应速度 / TTFT, TPS and latency tracking
+- 📈 **报告导出** — HTML / JSON / Markdown 一键生成,数据落盘 `~/.opencode/reports/` / One-click HTML/JSON/Markdown reports
+- 💰 **Go 余额查询** — 查询 OpenCode Go 套餐余量 / Check your OpenCode Go plan balance
+- 🖥️ **Windows 桌面权限弹窗** — AI 请求权限时右下角弹窗,可远程批准/拒绝 / Native Windows permission toast with allow/deny buttons
+- 🧩 **兼容 OpenCode 与 Mimo Code** — 同一插件,双端可用 / Works with both OpenCode and Mimo Code
+
+本项目基于 [opencode-token-watch](https://github.com/Howardzhangdqs/opencode-token-watch) 修改而来,特此鸣谢原项目作者。
 
 **新增权限请求弹窗**
 
