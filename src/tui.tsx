@@ -3,12 +3,14 @@ import { createSignal, createEffect, onCleanup } from "solid-js"
 import type { TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { readFileSync } from "node:fs"
+import { readFileSync, readdirSync, unlinkSync } from "node:fs"
 import { registerCommands } from "./commands.js"
 import { createPerfTracker } from "./perf-tracker.js"
 import { createGoUsageFetcher } from "./go-usage.js"
 import type { GoUsageFetcher } from "./go-usage.js"
+import { notifyWindows, notifyPermissionWindows } from "./notify.js"
 import { TokenWatchPanel } from "./sidebar.js"
+import { t } from "./i18n.js"
 
 export interface TokenMessage {
   id: string
@@ -26,6 +28,8 @@ export interface TokenMessage {
 function kvKey(sessionID: string): string {
   return "tokenwatch-msgs-" + sessionID
 }
+
+const approvalDirectory = join(homedir(), ".opencode", "tokenwatch-approvals")
 
 const tui: TuiPluginModule["tui"] = async (api) => {
   const perfTracker = createPerfTracker()
@@ -122,11 +126,82 @@ const tui: TuiPluginModule["tui"] = async (api) => {
   })
   cleanups.push(unsubRemoved)
 
-  // 会话整段空闲 → 刷新 Go 用量
+  // 会话整段空闲 → 刷新 Go 用量 + Windows 右下角提示
   const unsubSessionIdle = api.event.on("session.idle", () => {
     goUsageFetcher.refresh(true)
+    notifyWindows(t("notifySessionIdleTitle"), t("notifySessionIdleBody"))
   })
   cleanups.push(unsubSessionIdle)
+
+  // 已弹 Toast 的待审批权限请求；标记文件命中后调用 permission.reply 放行
+  const pendingRequests = new Map<string, { sessionID: string; permission: string; pattern: string }>()
+  const repliedIds = new Set<string>()
+
+  // 申请权限 → Windows 右下角三按钮 Toast（允许一次 / 总是允许 / 拒绝）
+  const unsubPermissionAsked = api.event.on("permission.asked", (event: any) => {
+    const props = event.properties as { id?: string; sessionID?: string; permission?: string; patterns?: string[] } | undefined
+    if (!props?.id) return
+    const permission = props.permission ?? ""
+    const pattern = (props.patterns ?? []).join(" ")
+    pendingRequests.set(props.id, { sessionID: props.sessionID ?? "", permission, pattern })
+    notifyPermissionWindows({
+      requestID: props.id,
+      title: t("notifyPermissionTitle"),
+      message: pattern ? `${permission}: ${pattern}` : permission,
+      allowOnceLabel: t("permAllowOnce"),
+      alwaysLabel: t("permAlways"),
+      rejectLabel: t("permReject"),
+      pid: process.pid,
+    })
+  })
+  cleanups.push(unsubPermissionAsked)
+
+  // 权限在终端内已被回复 → 从待审批表移除
+  const unsubPermissionReplied = api.event.on("permission.replied", (event: any) => {
+    const props = event.properties as { requestID?: string } | undefined
+    if (props?.requestID) pendingRequests.delete(props.requestID)
+  })
+  cleanups.push(unsubPermissionReplied)
+
+  // 轮询批准标记目录：用户点击 Toast 按钮后由 approve-handler.ps1 写入 <requestID>.<reply>
+  const pollTimer = setInterval(() => {
+    if (pendingRequests.size === 0) return
+    let entries: string[] = []
+    try {
+      entries = readdirSync(approvalDirectory)
+    } catch { return }
+    for (const entry of entries) {
+      const dotIdx = entry.lastIndexOf(".")
+      if (dotIdx <= 0) continue
+      const requestID = entry.slice(0, dotIdx)
+      const reply = entry.slice(dotIdx + 1)
+      if (reply !== "once" && reply !== "always" && reply !== "reject") continue
+      const pending = pendingRequests.get(requestID)
+      if (!pending || repliedIds.has(requestID)) continue
+
+      repliedIds.add(requestID)
+      pendingRequests.delete(requestID)
+      try { unlinkSync(join(approvalDirectory, entry)) } catch { }
+
+      api.client.permission
+        .reply({ requestID, reply })
+        .then((res: any) => {
+          const failed = res?.error != null
+          if (failed) {
+            api.ui.toast?.({ message: t("permReplyFailed"), variant: "error" })
+          } else {
+            api.ui.toast?.({
+              message: reply === "reject" ? t("permRejected") : t("permAllowed"),
+              variant: reply === "reject" ? "warning" : "success",
+            })
+          }
+        })
+        .catch(() => {
+          api.ui.toast?.({ message: t("permReplyFailed"), variant: "error" })
+        })
+    }
+  }, 300)
+  cleanups.push(() => clearInterval(pollTimer))
 
   api.lifecycle?.onDispose?.(() => {
     for (const cleanup of cleanups) cleanup()
