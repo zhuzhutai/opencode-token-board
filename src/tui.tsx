@@ -1,16 +1,17 @@
 /** @jsxImportSource @opentui/solid */
-import { createSignal, createEffect, onCleanup } from "solid-js"
+import { createSignal } from "solid-js"
 import type { TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { readdirSync, unlinkSync } from "node:fs"
+import { readdirSync, unlinkSync, watch, mkdirSync } from "node:fs"
+import type { FSWatcher } from "node:fs"
 import { registerCommands } from "./commands.js"
 import { createPerfTracker } from "./perf-tracker.js"
 import { createGoUsageFetcher } from "./go-usage.js"
 import type { GoUsageFetcher } from "./go-usage.js"
 import { createUpdateChecker } from "./update-check.js"
 import type { UpdateChecker } from "./update-check.js"
-import { notifyWindows, notifyPermissionWindows } from "./notify.js"
+import { notify, notifyPermission } from "./notify.js"
 import { TokenWatchPanel } from "./sidebar.js"
 import { t } from "./i18n.js"
 
@@ -40,6 +41,8 @@ const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
   const [sidebarRevision, setSidebarRevision] = createSignal(0)
   const [allTokenMessages, setAllTokenMessages] = createSignal<TokenMessage[]>([])
   let currentSlotSessionID = ""
+  let sessionLoadPending = false
+  let sessionRetryTimer: ReturnType<typeof setTimeout> | null = null
   const cleanups: (() => void)[] = []
 
   registerCommands(api, updateChecker)
@@ -120,6 +123,12 @@ const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
 
 
     setSidebarRevision((v) => v + 1)
+
+    // 会话历史可能刚异步载入完成 → 若仍在等待首次载入，被动补一次
+    if (sessionLoadPending && populateFromState(currentSlotSessionID)) {
+      sessionLoadPending = false
+      clearSessionRetry()
+    }
   })
   cleanups.push(unsubMsgUpdated)
 
@@ -138,45 +147,27 @@ const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
   })
   cleanups.push(unsubRemoved)
 
-  // 会话整段空闲 → 刷新 Go 用量 + Windows 右下角提示
+  // 会话整段空闲 → 刷新 Go 用量 + 桌面提示
   const unsubSessionIdle = api.event.on("session.idle", () => {
     goUsageFetcher.refresh(true)
-    notifyWindows(t("notifySessionIdleTitle"), t("notifySessionIdleBody"))
+    if (populateFromState(currentSlotSessionID)) {
+      sessionLoadPending = false
+      clearSessionRetry()
+    }
+    notify(t("notifySessionIdleTitle"), t("notifySessionIdleBody"))
   })
   cleanups.push(unsubSessionIdle)
 
-  // 已弹 Toast 的待审批权限请求；标记文件命中后调用 permission.reply 放行
+  // 已弹提示的待审批权限请求；标记文件命中后调用 permission.reply 放行
   const pendingRequests = new Map<string, { sessionID: string; permission: string; pattern: string }>()
   const repliedIds = new Set<string>()
 
-  // 申请权限 → Windows 右下角三按钮 Toast（允许一次 / 总是允许 / 拒绝）
-  const unsubPermissionAsked = api.event.on("permission.asked", (event: any) => {
-    const props = event.properties as { id?: string; sessionID?: string; permission?: string; patterns?: string[] } | undefined
-    if (!props?.id) return
-    const permission = props.permission ?? ""
-    const pattern = (props.patterns ?? []).join(" ")
-    pendingRequests.set(props.id, { sessionID: props.sessionID ?? "", permission, pattern })
-    notifyPermissionWindows({
-      requestID: props.id,
-      title: t("notifyPermissionTitle"),
-      message: pattern ? `${permission}: ${pattern}` : permission,
-      allowOnceLabel: t("permAllowOnce"),
-      alwaysLabel: t("permAlways"),
-      rejectLabel: t("permReject"),
-      pid: process.pid,
-    })
-  })
-  cleanups.push(unsubPermissionAsked)
+  // ── 批准标记目录：事件驱动监听（取代旧的 300ms 轮询）──
+  // 弹窗进程（PowerShell / osascript）写 <requestID>.<once|always|reject>，
+  // 这里用 fs.watch 被动接收目录变更；仅在有待审批请求时开启，处理完即关闭。
+  let approvalWatcher: FSWatcher | null = null
 
-  // 权限在终端内已被回复 → 从待审批表移除
-  const unsubPermissionReplied = api.event.on("permission.replied", (event: any) => {
-    const props = event.properties as { requestID?: string } | undefined
-    if (props?.requestID) pendingRequests.delete(props.requestID)
-  })
-  cleanups.push(unsubPermissionReplied)
-
-  // 轮询批准标记目录：用户点击 Toast 按钮后由 approve-handler.ps1 写入 <requestID>.<reply>
-  const pollTimer = setInterval(() => {
+  function processApprovals(): void {
     if (pendingRequests.size === 0) return
     let entries: string[] = []
     try {
@@ -212,8 +203,154 @@ const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
           api.ui.toast?.({ message: t("permReplyFailed"), variant: "error" })
         })
     }
-  }, 300)
-  cleanups.push(() => clearInterval(pollTimer))
+    syncApprovalWatcher()
+  }
+
+  function stopApprovalWatcher(): void {
+    if (!approvalWatcher) return
+    try { approvalWatcher.close() } catch { /* ignore */ }
+    approvalWatcher = null
+  }
+
+  function syncApprovalWatcher(): void {
+    if (pendingRequests.size === 0) {
+      stopApprovalWatcher()
+      return
+    }
+    if (approvalWatcher) return
+    try {
+      mkdirSync(approvalDirectory, { recursive: true })
+      approvalWatcher = watch(approvalDirectory, { persistent: false }, () => processApprovals())
+      approvalWatcher.on("error", () => stopApprovalWatcher())
+    } catch {
+      stopApprovalWatcher()
+    }
+  }
+  cleanups.push(stopApprovalWatcher)
+
+  // 申请权限 → 右下角三按钮提示（允许一次 / 总是允许 / 拒绝）
+  const unsubPermissionAsked = api.event.on("permission.asked", (event: any) => {
+    const props = event.properties as { id?: string; sessionID?: string; permission?: string; patterns?: string[] } | undefined
+    if (!props?.id) return
+    const permission = props.permission ?? ""
+    const pattern = (props.patterns ?? []).join(" ")
+    pendingRequests.set(props.id, { sessionID: props.sessionID ?? "", permission, pattern })
+    syncApprovalWatcher()
+    processApprovals()   // 兜底：标记可能已先于 watcher 建立写入
+    notifyPermission({
+      requestID: props.id,
+      title: t("notifyPermissionTitle"),
+      message: pattern ? `${permission}: ${pattern}` : permission,
+      allowOnceLabel: t("permAllowOnce"),
+      alwaysLabel: t("permAlways"),
+      rejectLabel: t("permReject"),
+      pid: process.pid,
+    })
+  })
+  cleanups.push(unsubPermissionAsked)
+
+  // 权限在终端内已被回复 → 从待审批表移除
+  const unsubPermissionReplied = api.event.on("permission.replied", (event: any) => {
+    const props = event.properties as { requestID?: string } | undefined
+    if (props?.requestID) {
+      pendingRequests.delete(props.requestID)
+      syncApprovalWatcher()
+    }
+  })
+  cleanups.push(unsubPermissionReplied)
+
+  // ── 会话历史消息加载：事件驱动 + 有界退避重试（取代旧的 200ms×50 轮询）──
+  // opencode 的历史会话消息可能是异步载入的，且 api.state.session.messages 并非
+  // Solid 响应式源。旧实现固定每 200ms 轮询 10 秒；现在改为：
+  //   ① 打开会话时立即读一次；
+  //   ② 若为空，按 250/500/1000/2000/3000ms 退避重试（合计 ~7s，覆盖冷载入）；
+  //   ③ message.updated / session.idle 到达时被动再读一次并提前结束重试。
+  function clearSessionRetry(): void {
+    if (sessionRetryTimer) { clearTimeout(sessionRetryTimer); sessionRetryTimer = null }
+  }
+
+  function tokenMessagesFromState(sessionID: string): TokenMessage[] {
+    const existing = api.state.session.messages(sessionID)
+    if (!existing || existing.length === 0) return []
+    const out: TokenMessage[] = []
+    for (const msg of existing) {
+      if ((msg as any).role !== "assistant") continue
+      const tokens = (msg as any).tokens
+      // 与 message.updated 处理器保持一致：过滤 total=0 的失败请求
+      if (!tokens || (tokens.total ?? 0) === 0) continue
+      out.push({
+        id: (msg as any).id,
+        sessionID,
+        providerID: (msg as any).providerID ?? "unknown",
+        modelID: (msg as any).modelID ?? "unknown",
+        inputTokens: tokens?.input ?? 0,
+        outputTokens: tokens?.output ?? 0,
+        reasoningTokens: tokens?.reasoning ?? 0,
+        cacheRead: tokens?.cache?.read ?? 0,
+        cacheWrite: tokens?.cache?.write ?? 0,
+        cost: (msg as any).cost ?? 0,
+      })
+    }
+    return out
+  }
+
+  /** 将宿主已载入的消息合并进面板数据；返回是否已有数据。 */
+  function populateFromState(sessionID: string): boolean {
+    if (!sessionID) return true
+    const incoming = tokenMessagesFromState(sessionID)
+    if (incoming.length === 0) return false
+    setAllTokenMessages((prev) => {
+      let changed = false
+      const next = [...prev]
+      for (const tokenMsg of incoming) {
+        const idx = next.findIndex(m => m.id === tokenMsg.id)
+        if (idx >= 0) {
+          const cur = next[idx]
+          if (
+            cur.inputTokens !== tokenMsg.inputTokens ||
+            cur.outputTokens !== tokenMsg.outputTokens ||
+            cur.reasoningTokens !== tokenMsg.reasoningTokens ||
+            cur.cacheRead !== tokenMsg.cacheRead ||
+            cur.cacheWrite !== tokenMsg.cacheWrite ||
+            cur.cost !== tokenMsg.cost
+          ) {
+            next[idx] = tokenMsg
+            changed = true
+          }
+        } else {
+          next.push(tokenMsg)
+          changed = true
+        }
+      }
+      if (changed) {
+        persistToKv(sessionID, next)
+        return next
+      }
+      return prev
+    })
+    return true
+  }
+
+  function scheduleSessionRetries(sessionID: string): void {
+    clearSessionRetry()
+    sessionLoadPending = true
+    const delays = [250, 500, 1000, 2000, 3000]
+    let attempt = 0
+    const tick = () => {
+      if (currentSlotSessionID !== sessionID) return
+      if (populateFromState(sessionID)) {
+        sessionLoadPending = false
+        return
+      }
+      if (attempt >= delays.length) { sessionLoadPending = false; return }
+      const delay = delays[attempt++]
+      sessionRetryTimer = setTimeout(tick, delay)
+      ;(sessionRetryTimer as any).unref?.()
+    }
+    sessionRetryTimer = setTimeout(tick, delays[attempt++])
+    ;(sessionRetryTimer as any).unref?.()
+  }
+  cleanups.push(clearSessionRetry)
 
   api.lifecycle?.onDispose?.(() => {
     for (const cleanup of cleanups) cleanup()
@@ -227,7 +364,8 @@ const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
 
         if (session_id && session_id !== currentSlotSessionID) {
           currentSlotSessionID = session_id
-          perfTracker.loadSession(session_id)
+          // 异步加载本会话历史性能统计，完成后触发一次重绘（避免同步读全量 JSONL 卡住 UI）
+          void perfTracker.loadSessionAsync(session_id, () => setSidebarRevision(v => v + 1))
 
           let loaded: TokenMessage[] = []
           try {
@@ -235,91 +373,15 @@ const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
             if (saved && saved.length > 0) loaded = saved
           } catch {}
           setAllTokenMessages(loaded)
+
+          // 立即合并宿主已载入的消息；为空则进入有界退避重试（事件到达会提前结束）
+          if (populateFromState(session_id)) {
+            sessionLoadPending = false
+            clearSessionRetry()
+          } else {
+            scheduleSessionRetries(session_id)
+          }
         }
-
-        // 引入 createEffect 监听历史会话消息在后台异步加载完毕后的变化
-        // 由于历史会话加载可能是异步的，初次检查 messages 可能为空且底层并非响应式数据源，
-        // 故采用短期高频轮询，直到数据加载完成或超时。
-        createEffect(() => {
-          if (!session_id) return
-
-          let timer: any = null
-          let pollCount = 0
-          const maxPolls = 50 // 最多轮询 10 秒 (50 * 200ms)
-
-          const checkAndPopulate = () => {
-            const existing = api.state.session.messages(session_id)
-            if (!existing || existing.length === 0) return false
-
-            setAllTokenMessages((prev) => {
-              let changed = false
-              const next = [...prev]
-              for (const msg of existing) {
-                if ((msg as any).role !== "assistant") continue
-                const tokens = (msg as any).tokens
-                // 与 message.updated 处理器保持一致：过滤 total=0 的失败请求
-                if (!tokens || (tokens.total ?? 0) === 0) continue
-
-                const id = (msg as any).id
-                const idx = next.findIndex(m => m.id === id)
-                const tokenMsg: TokenMessage = {
-                  id,
-                  sessionID: session_id,
-                  providerID: (msg as any).providerID ?? "unknown",
-                  modelID: (msg as any).modelID ?? "unknown",
-                  inputTokens: tokens?.input ?? 0,
-                  outputTokens: tokens?.output ?? 0,
-                  reasoningTokens: tokens?.reasoning ?? 0,
-                  cacheRead: tokens?.cache?.read ?? 0,
-                  cacheWrite: tokens?.cache?.write ?? 0,
-                  cost: (msg as any).cost ?? 0,
-                }
-
-                if (idx >= 0) {
-                  const cur = next[idx]
-                  if (
-                    cur.inputTokens !== tokenMsg.inputTokens ||
-                    cur.outputTokens !== tokenMsg.outputTokens ||
-                    cur.reasoningTokens !== tokenMsg.reasoningTokens ||
-                    cur.cacheRead !== tokenMsg.cacheRead ||
-                    cur.cacheWrite !== tokenMsg.cacheWrite ||
-                    cur.cost !== tokenMsg.cost
-                  ) {
-                    next[idx] = tokenMsg
-                    changed = true
-                  }
-                } else {
-                  next.push(tokenMsg)
-                  changed = true
-                }
-              }
-
-              if (changed) {
-                persistToKv(session_id, next)
-                return next
-              }
-              return prev
-            })
-            return true
-          }
-
-          const hasMessages = checkAndPopulate()
-          if (!hasMessages) {
-            timer = setInterval(() => {
-              pollCount++
-              if (checkAndPopulate() || pollCount >= maxPolls) {
-                clearInterval(timer)
-                timer = null
-              }
-            }, 200)
-          }
-
-          onCleanup(() => {
-            if (timer) {
-              clearInterval(timer)
-            }
-          })
-        })
 
         return <TokenWatchPanel api={api} theme={api.theme} perfTracker={perfTracker} messages={() => api.state.session.messages(session_id)} allTokenMessages={allTokenMessages} goUsageFetcher={goUsageFetcher} updateChecker={updateChecker} />
       },

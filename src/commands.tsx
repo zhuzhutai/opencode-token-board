@@ -6,7 +6,8 @@ import type { CombinedReportData, HtmlReportMeta } from "./formatter.js"
 import { generateUsageHtml } from "./generate-usage-html.js"
 import { t, setLanguage } from "./i18n.js"
 import type { SupportedLanguage } from "./i18n.js"
-import type { SidebarConfig } from "./sidebar.js"
+import { getConfig, saveConfig } from "./config-store.js"
+import type { SidebarConfig } from "./config-store.js"
 import type { UpdateChecker } from "./update-check.js"
 import { readLogs } from "./perf-tracker.js"
 import type { LogEntry, ModelPerfStats } from "./formatter.js"
@@ -15,11 +16,6 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import { execSync } from "node:child_process"
-
-const DEFAULT_CONFIG: SidebarConfig = {
-  sidebar: { showPerformance: true, showTokenDistribution: true, showGoUsage: true },
-  language: "auto",
-}
 
 export async function registerCommands(api: TuiPluginApi, updateChecker?: UpdateChecker): Promise<void> {
   api.command?.register(() => [
@@ -289,7 +285,7 @@ function showHtmlReportRangeMenu(api: TuiPluginApi, dialog: TuiDialogStack): voi
 }
 
 function showUsageMenu(api: TuiPluginApi, dialog: TuiDialogStack, updateChecker?: UpdateChecker): void {
-  try { setLanguage(loadConfigFromStore(api).language) } catch {}
+  try { setLanguage(getConfig(api).language) } catch {}
   const update = updateChecker?.info() ?? null
   dialog.replace(() => (
     <api.ui.DialogSelect
@@ -333,7 +329,7 @@ function showUsageMenu(api: TuiPluginApi, dialog: TuiDialogStack, updateChecker?
 }
 
 function showUpdateMenu(api: TuiPluginApi, dialog: TuiDialogStack, checker: UpdateChecker): void {
-  try { setLanguage(loadConfigFromStore(api).language) } catch {}
+  try { setLanguage(getConfig(api).language) } catch {}
   const info = checker.info()
   const options: Array<{ title: string; value: string; description?: string; onSelect?: () => void }> = []
 
@@ -413,33 +409,22 @@ async function showTextReport(api: TuiPluginApi): Promise<void> {
   }
 }
 
-function saveConfigToStore(api: TuiPluginApi, cfg: SidebarConfig): void {
-  api.kv?.set?.("tokenwatch-config", cfg)
-}
-
-function bumpConfigVersion(api: TuiPluginApi): void {
-  const v = (api.kv?.get?.("tokenwatch-config-version") as number ?? 0) + 1
-  api.kv?.set?.("tokenwatch-config-version", v)
-}
-
 function saveGoKey(api: TuiPluginApi, value: string): void {
-  const current = loadConfigFromStore(api)
+  const current = getConfig(api)
   const go: { apiKey?: string } = { ...(current.go ?? {}) }
   go.apiKey = value
   current.go = go
-  saveConfigToStore(api, current)
-  bumpConfigVersion(api)
+  saveConfig(api, current)
 }
 
 function clearGoConfig(api: TuiPluginApi): void {
-  const current = loadConfigFromStore(api)
+  const current = getConfig(api)
   current.go = {}
-  saveConfigToStore(api, current)
-  bumpConfigVersion(api)
+  saveConfig(api, current)
 }
 
 function promptGoKey(api: TuiPluginApi, dialog: TuiDialogStack): void {
-  const cfg = loadConfigFromStore(api)
+  const cfg = getConfig(api)
   const current = cfg.go?.apiKey ?? ""
   dialog.replace(() => (
     <api.ui.DialogPrompt
@@ -456,7 +441,7 @@ function promptGoKey(api: TuiPluginApi, dialog: TuiDialogStack): void {
 }
 
 function showGoConfigMenu(api: TuiPluginApi, dialog: TuiDialogStack): void {
-  const cfg = loadConfigFromStore(api)
+  const cfg = getConfig(api)
   const go = cfg.go ?? {}
   dialog.replace(() => (
     <api.ui.DialogSelect
@@ -495,7 +480,7 @@ function showSettingsDialog(api: TuiPluginApi, dialog?: TuiDialogStack): void {
     setTimeout(() => showSettingsDialog(api, dialog), 0)
   }
 
-  const cfg = loadConfigFromStore(api).sidebar
+  const cfg = getConfig(api).sidebar
 
   dialog.replace(() => (
     <api.ui.DialogSelect
@@ -546,7 +531,7 @@ function showSettingsDialog(api: TuiPluginApi, dialog?: TuiDialogStack): void {
 }
 
 function showLanguageMenu(api: TuiPluginApi, dialog: TuiDialogStack): void {
-  const current = (api.kv?.get?.("tokenwatch-config") as Partial<SidebarConfig>)?.language ?? "auto"
+  const current = getConfig(api).language ?? "auto"
   dialog.replace(() => (
     <api.ui.DialogSelect
       title={t("settingsLanguage")}
@@ -578,29 +563,13 @@ function showLanguageMenu(api: TuiPluginApi, dialog: TuiDialogStack): void {
 
 function setLanguageSetting(api: TuiPluginApi, lang: SupportedLanguage | "auto"): void {
   setLanguage(lang)
-  const current = loadConfigFromStore(api)
+  const current = getConfig(api)
   current.language = lang
-  saveConfigToStore(api, current)
-  const v = (api.kv?.get?.("tokenwatch-config-version") as number ?? 0) + 1
-  api.kv?.set?.("tokenwatch-config-version", v)
+  saveConfig(api, current)
 }
 
 function toggleSidebarSetting(api: TuiPluginApi, key: keyof SidebarConfig["sidebar"]): void {
-  const current = loadConfigFromStore(api)
+  const current = getConfig(api)
   current.sidebar[key] = !current.sidebar[key]
-  saveConfigToStore(api, current)
-  bumpConfigVersion(api)
-}
-
-function loadConfigFromStore(api: TuiPluginApi): SidebarConfig {
-  const base = { sidebar: { ...DEFAULT_CONFIG.sidebar }, language: DEFAULT_CONFIG.language, go: {} as { apiKey?: string } }
-  try {
-    const stored = api.kv?.get?.("tokenwatch-config") as Partial<SidebarConfig> | undefined
-    if (stored) {
-      if (stored.sidebar) Object.assign(base.sidebar, stored.sidebar)
-      if (stored.language) base.language = stored.language
-      if (stored.go) base.go = stored.go
-    }
-  } catch { /* defaults */ }
-  return base
+  saveConfig(api, current)
 }

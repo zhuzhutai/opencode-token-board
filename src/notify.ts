@@ -1,15 +1,21 @@
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
+import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
-import { unlinkSync, writeFileSync } from "node:fs"
+import { unlinkSync, writeFileSync, mkdirSync } from "node:fs"
 
 /**
- * Windows 桌面提示。
+ * 桌面提示（跨平台）。
  *
- * 不使用 ToastNotificationManager：传统 Node/PowerShell 进程没有注册 AUMID 时，
- * WinRT 的 Show() 可能静默成功但用户看不到任何通知。这里使用 WinForms 创建
- * 一个真正位于屏幕右下角的顶层矩形小窗，权限按钮直接写入本地批准标记。
+ * Windows：不用 ToastNotificationManager（未注册 AUMID 的传统进程会静默失败），
+ *          改用 WinForms 顶层小窗，权限按钮直接写入本地批准标记；通过 wscript
+ *          以 ShellExecute 拉起独立 GUI 进程，避免继承无窗口标志。
+ * macOS：  osascript + `display notification`（会话结束）/ `display dialog`（权限），
+ *          权限对话框点按后由 AppleScript 直接写出同样的批准标记文件。
+ * Linux：  notify-send 兜底通知（权限按钮无法可靠实现，请在 TUI 内回复）。
+ *
+ * 批准标记协议（跨平台一致，供 tui.tsx 监听目录）：
+ *   ~/.opencode/tokenwatch-approvals/<requestID>.<once|always|reject>
  */
 
 function psQuote(value: string): string {
@@ -59,6 +65,144 @@ function runPowerShell(script: string): void {
     /* 桌面提示失败不影响插件主流程 */
   }
 }
+
+/** 分离式 spawn 一个外部命令（macOS / Linux 提示用），失败静默。 */
+function spawnDetached(command: string, args: string[]): void {
+  try {
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true })
+    child.unref()
+  } catch {
+    /* 提示失败不影响插件主流程 */
+  }
+}
+
+// ─────────────────────────────────────────────
+// macOS (AppleScript)
+// ─────────────────────────────────────────────
+
+/** AppleScript 字符串字面量转义（双引号 + 反斜杠）。 */
+function asQuote(value: string): string {
+  return '"' + value.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'
+}
+
+/** POSIX shell 单引号转义。 */
+function shQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\\''") + "'"
+}
+
+/** 会话结束通知（macOS）：非阻塞，osascript 执行完即退出。 */
+export function macNotifyScript(title: string, message: string): string {
+  return `display notification ${asQuote(message)} with title ${asQuote(title)}`
+}
+
+/**
+ * 权限弹窗（macOS）：三按钮对话框，点按后写出与 Windows 完全一致的批准标记。
+ * display dialog 会阻塞该 osascript 进程直到用户选择，进程以 detached 方式拉起。
+ */
+export function macPermissionScript(input: PermissionToastInput): string {
+  const approvalDir = join(homedir(), ".opencode", "tokenwatch-approvals")
+  const buttons: Array<{ label: string; reply: string }> = [
+    { label: input.allowOnceLabel, reply: "once" },
+    { label: input.alwaysLabel, reply: "always" },
+    { label: input.rejectLabel, reply: "reject" },
+  ]
+  const buttonList = buttons.map((b) => asQuote(b.label)).join(", ")
+  const branches = buttons
+    .map((b, index) => {
+      const marker = join(approvalDir, `${input.requestID}.${b.reply}`)
+      const shell = `mkdir -p ${shQuote(approvalDir)} && : > ${shQuote(marker)}`
+      const lead = index === 0 ? "if" : "else if"
+      return `${lead} theReply is ${asQuote(b.label)} then\n  do shell script ${asQuote(shell)}`
+    })
+    .join("\n")
+  return [
+    `set theReply to button returned of (display dialog ${asQuote(input.message)} with title ${asQuote(input.title)} buttons {${buttonList}} default button 1 with icon caution)`,
+    branches,
+    "end if",
+  ].join("\n")
+}
+
+// ─────────────────────────────────────────────
+// Linux (zenity / notify-send)
+// ─────────────────────────────────────────────
+
+export function linuxNotifyArgs(title: string, message: string): string[] {
+  return [title, message]
+}
+
+export interface ZenityPlan {
+  command: string
+  args: string[]
+}
+
+/**
+ * Linux 权限弹窗（zenity 三按钮）。
+ * 用 `--switch` 抑制默认的 OK/Cancel，改用三个 `--extra-button`；点击的按钮文案会
+ * 打印到 stdout，据此判定动作——比依赖 exit code（extra button 在不同版本返回 0/1/2
+ * 不一致）更可靠。
+ */
+export function linuxPermissionPlan(input: PermissionToastInput): ZenityPlan {
+  return {
+    command: "zenity",
+    args: [
+      "--question",
+      "--title", input.title,
+      "--text", input.message,
+      "--switch",
+      "--extra-button", input.allowOnceLabel,
+      "--extra-button", input.alwaysLabel,
+      "--extra-button", input.rejectLabel,
+      "--width", "420",
+    ],
+  }
+}
+
+/** 将 zenity 返回的按钮文案映射为批准动作；空（Esc/关窗）或未知文案返回 null。 */
+export function linuxReplyFromButton(label: string, input: PermissionToastInput): "once" | "always" | "reject" | null {
+  const v = (label ?? "").trim()
+  if (!v) return null
+  if (v === input.allowOnceLabel) return "once"
+  if (v === input.alwaysLabel) return "always"
+  if (v === input.rejectLabel) return "reject"
+  return null
+}
+
+/** 写入批准标记文件（与 Windows/macOS 协议一致）。 */
+function writeApprovalMarker(requestID: string, reply: string): void {
+  try {
+    const dir = join(homedir(), ".opencode", "tokenwatch-approvals")
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${requestID}.${reply}`), "")
+  } catch { /* ignore */ }
+}
+
+/** 拉起 zenity 三按钮对话框；缺 zenity 时退化为 notify-send 通知。 */
+function spawnLinuxPermission(input: PermissionToastInput): void {
+  const plan = linuxPermissionPlan(input)
+  try {
+    const child = spawn(plan.command, plan.args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
+    let out = ""
+    let settled = false
+    child.stdout?.on("data", (chunk) => { out += String(chunk) })
+    child.on("error", () => {
+      if (settled) return
+      settled = true
+      spawnDetached("notify-send", linuxNotifyArgs(input.title, input.message))
+    })
+    child.on("close", () => {
+      if (settled) return
+      settled = true
+      const reply = linuxReplyFromButton(out, input)
+      if (reply) writeApprovalMarker(input.requestID, reply)
+    })
+  } catch {
+    spawnDetached("notify-send", linuxNotifyArgs(input.title, input.message))
+  }
+}
+
+// ─────────────────────────────────────────────
+// Windows popup 脚本（保持原样，供测试与 win32 使用）
+// ─────────────────────────────────────────────
 
 export function popupScript(title: string, message: string, timeoutMs: number, buttons?: Array<{ label: string; reply: string; color: string; hover: string }>, requestID?: string, processID?: number): string {
   const W = 520
@@ -175,12 +319,19 @@ $timer.Start()
 
 let lastNotifyAt = 0
 
-export function notifyWindows(title: string, message: string): void {
-  if (process.platform !== "win32") return
+/** 会话结束提示（跨平台）。 */
+export function notify(title: string, message: string): void {
   const now = Date.now()
   if (now - lastNotifyAt < 1000) return
   lastNotifyAt = now
-  runPowerShell(popupScript(title, message, 6000))
+
+  if (process.platform === "win32") {
+    runPowerShell(popupScript(title, message, 6000))
+  } else if (process.platform === "darwin") {
+    spawnDetached("osascript", ["-e", macNotifyScript(title, message)])
+  } else if (process.platform === "linux") {
+    spawnDetached("notify-send", linuxNotifyArgs(title, message))
+  }
 }
 
 const shownPermissionIds = new Set<string>()
@@ -195,21 +346,27 @@ export interface PermissionToastInput {
   pid: number
 }
 
-export function notifyPermissionWindows(input: PermissionToastInput): void {
-  if (process.platform !== "win32") return
+/** 权限请求提示（跨平台）。macOS 点按后同样写出批准标记文件。 */
+export function notifyPermission(input: PermissionToastInput): void {
   if (shownPermissionIds.has(input.requestID)) return
   shownPermissionIds.add(input.requestID)
 
-  runPowerShell(popupScript(
-    input.title,
-    input.message,
-    120000,
-    [
-      { label: input.allowOnceLabel, reply: "once", color: "#2E7D32", hover: "#388E3C" },
-      { label: input.alwaysLabel, reply: "always", color: "#1565C0", hover: "#1976D2" },
-      { label: input.rejectLabel, reply: "reject", color: "#C62828", hover: "#D32F2F" },
-    ],
-    input.requestID,
-    input.pid,
-  ))
+  if (process.platform === "win32") {
+    runPowerShell(popupScript(
+      input.title,
+      input.message,
+      120000,
+      [
+        { label: input.allowOnceLabel, reply: "once", color: "#2E7D32", hover: "#388E3C" },
+        { label: input.alwaysLabel, reply: "always", color: "#1565C0", hover: "#1976D2" },
+        { label: input.rejectLabel, reply: "reject", color: "#C62828", hover: "#D32F2F" },
+      ],
+      input.requestID,
+      input.pid,
+    ))
+  } else if (process.platform === "darwin") {
+    spawnDetached("osascript", ["-e", macPermissionScript(input)])
+  } else if (process.platform === "linux") {
+    spawnLinuxPermission(input)
+  }
 }

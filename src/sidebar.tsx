@@ -63,20 +63,10 @@ import type { UpdateChecker } from "./update-check.js"
  *  ──────────────────────────────────────────────────────────────────
  */
 
-export interface SidebarConfig {
-  sidebar: {
-    showPerformance: boolean
-    showTokenDistribution: boolean
-    showGoUsage: boolean
-  }
-  language: "zh" | "en" | "auto"
-  go?: { apiKey?: string }
-}
+import { getConfig, subscribeConfig } from "./config-store.js"
+import type { SidebarConfig } from "./config-store.js"
 
-const DEFAULT_CONFIG: SidebarConfig = {
-  sidebar: { showPerformance: true, showTokenDistribution: true, showGoUsage: true },
-  language: "auto",
-}
+export type { SidebarConfig } from "./config-store.js"
 
 // 计算字符串在终端里的可视宽度（中文/日韩=2 宽，其余=1）。所有宽度换算都用它，避免中文撑破对齐
 function getVisualWidth(str: string): number {
@@ -210,21 +200,6 @@ function saveCollapseState(api: TuiPluginApi, state: CollapseState): void {
   try { api.kv?.set?.("tokenwatch-collapse", state) } catch { /* non-critical */ }
 }
 
-export function loadConfig(api: TuiPluginApi): SidebarConfig {
-  const base = { sidebar: { ...DEFAULT_CONFIG.sidebar }, language: DEFAULT_CONFIG.language, go: {} as { apiKey?: string } }
-  try {
-    const pluginCfg = (api as any).config?.pluginConfig?.["opencode-token-board"]
-    if (pluginCfg?.sidebar) Object.assign(base.sidebar, pluginCfg.sidebar)
-    if (pluginCfg?.language) base.language = pluginCfg.language
-    if (pluginCfg?.go) base.go = pluginCfg.go
-    const overrides = api.kv?.get?.("tokenwatch-config") as Partial<SidebarConfig> | undefined
-    if (overrides?.sidebar) Object.assign(base.sidebar, overrides.sidebar)
-    if (overrides?.language) base.language = overrides.language
-    if (overrides?.go) base.go = overrides.go
-  } catch { /* defaults */ }
-  return base
-}
-
 interface ModelAgg {
   providerID: string
   modelID: string
@@ -252,10 +227,9 @@ interface TokenWatchPanelProps {
 export function TokenWatchPanel(props: TokenWatchPanelProps) {
   const { api, theme, perfTracker } = props
   const getMessages = () => props.messages()
-  const [config, setConfig] = createSignal<SidebarConfig>(loadConfig(api))
+  const [config, setConfig] = createSignal<SidebarConfig>(getConfig(api))
   // 同步初始化语言以防首帧渲染使用错误的 detectLanguage 默认值
   setLanguage(config().language)
-  let knownCfgVer = api.kv?.get?.("tokenwatch-config-version") as number | undefined
 
   // ── 响应式翻译函数 ──
   const t = (key: string) => {
@@ -278,16 +252,14 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
   }
   syncGoConfig()
 
-  createEffect(() => {
-    const timer = setInterval(() => {
-      const v = api.kv?.get?.("tokenwatch-config-version") as number | undefined
-      if (v != null && v !== knownCfgVer) {
-        knownCfgVer = v
-        setConfig(loadConfig(api))
-        syncGoConfig()
-      }
-    }, 500)
-    onCleanup(() => clearInterval(timer))
+  // ── 配置变更：被动订阅（取代旧的 500ms kv 版本轮询）──
+  // 设置只能由本进程内的 /usage 菜单修改，saveConfig 会直接广播。
+  onMount(() => {
+    const unsub = subscribeConfig(() => {
+      setConfig({ ...getConfig(api) })
+      syncGoConfig()
+    })
+    onCleanup(() => { try { unsub() } catch { } })
   })
 
   const [collapse, setCollapse] = createSignal<CollapseState>(loadCollapseState(api))
@@ -551,8 +523,22 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
   }
 
   onMount(() => {
-    const unsubPart = api.event?.on?.("message.part.updated", () => setPartVersion(v => v + 1))
-    onCleanup(() => { try { unsubPart?.() } catch { } })
+    // 流式生成期间 `message.part.updated` 触发极频繁（每个分片一次），
+    // 这里节流合并为最多约 4 次/秒，避免 tokenDistribution / perfStats 每个分片都全量重算。
+    let scheduled: ReturnType<typeof setTimeout> | null = null
+    const bumpThrottled = () => {
+      if (scheduled) return
+      scheduled = setTimeout(() => {
+        scheduled = null
+        setPartVersion(v => v + 1)
+      }, 250)
+      ;(scheduled as any).unref?.()
+    }
+    const unsubPart = api.event?.on?.("message.part.updated", bumpThrottled)
+    onCleanup(() => {
+      try { unsubPart?.() } catch { }
+      if (scheduled) clearTimeout(scheduled)
+    })
   })
 
   return (

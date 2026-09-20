@@ -1,16 +1,19 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { LogEntry, ModelPerfStats, SessionPerfStats } from "./formatter.js"
 import { computeTps } from "./formatter.js"
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs"
+import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { homedir } from "node:os"
-import { existsSync, statSync } from "node:fs"
 import { updatePersistedStats } from "./stats-store.js"
 
 const LOG_PATH = join(homedir(), ".opencode", "tokenwatch.jsonl")
 
 /** 侧边栏"瞬时"TPS 使用的滚动窗口大小（最近 N 次请求） */
 const TPS_ROLLING_WINDOW = 5
+
+/** 分位数原始样本上限：有界内存 + 有界排序开销（报告口径，侧边栏不使用） */
+const SAMPLE_CAP = 2000
 
 interface PartEvent {
   message_id?: string
@@ -70,6 +73,61 @@ class PerfTracker {
   private reasoningMessages = new Set<string>()
   /** 每个模型最近 N 次请求的 TPS 样本，用于计算滚动"瞬时"TPS */
   private tpsWindow = new Map<string, number[]>()
+  /** JSONL 解析缓存：文件 mtime/size 未变时复用，避免反复读盘 + 解析 */
+  private logCache: { mtimeMs: number; size: number; entries: LogEntry[] } | null = null
+
+  /** 有界追加：超过上限时丢弃最旧样本，保证排序/内存开销有界 */
+  private pushSample(arr: number[], value: number): void {
+    arr.push(value)
+    if (arr.length > SAMPLE_CAP) arr.splice(0, arr.length - SAMPLE_CAP)
+  }
+
+  private parseLogLines(content: string): LogEntry[] {
+    const entries: LogEntry[] = []
+    if (!content) return entries
+    for (const line of content.split("\n")) {
+      if (!line) continue
+      try {
+        entries.push(JSON.parse(line) as LogEntry)
+      } catch {
+        // Skip malformed lines
+      }
+    }
+    return entries
+  }
+
+  /** 同步读取并解析 JSONL（带 mtime/size 缓存）。 */
+  private readLogEntriesSync(): LogEntry[] {
+    try {
+      if (!existsSync(LOG_PATH)) return []
+      const st = statSync(LOG_PATH)
+      if (this.logCache && this.logCache.mtimeMs === st.mtimeMs && this.logCache.size === st.size) {
+        return this.logCache.entries
+      }
+      const entries = this.parseLogLines(readFileSync(LOG_PATH, "utf-8").trim())
+      this.logCache = { mtimeMs: st.mtimeMs, size: st.size, entries }
+      return entries
+    } catch {
+      return []
+    }
+  }
+
+  /** 异步读取并解析 JSONL（带 mtime/size 缓存），用于会话切换，避免阻塞 UI 线程。 */
+  private async readLogEntriesAsync(): Promise<LogEntry[]> {
+    try {
+      if (!existsSync(LOG_PATH)) return []
+      const st = statSync(LOG_PATH)
+      if (this.logCache && this.logCache.mtimeMs === st.mtimeMs && this.logCache.size === st.size) {
+        return this.logCache.entries
+      }
+      const content = (await readFile(LOG_PATH, "utf-8")).trim()
+      const entries = this.parseLogLines(content)
+      this.logCache = { mtimeMs: st.mtimeMs, size: st.size, entries }
+      return entries
+    } catch {
+      return []
+    }
+  }
 
   handlePartUpdated(event: PartEvent): void {
     if (!event.message_id) return
@@ -239,9 +297,9 @@ class PerfTracker {
       stats.avgTTFT = prev !== null ? prev + (entry.ttft_ms - prev) / c : entry.ttft_ms
       stats.maxTTFT = stats.maxTTFT !== null ? Math.max(stats.maxTTFT, entry.ttft_ms) : entry.ttft_ms
       stats.minTTFT = stats.minTTFT !== null ? Math.min(stats.minTTFT, entry.ttft_ms) : entry.ttft_ms
-      // 收集原始样本用于分位数计算
+      // 收集原始样本用于分位数计算（有界）
       const ttftArr = this.ttftSamples.get(model) ?? []
-      ttftArr.push(entry.ttft_ms)
+      this.pushSample(ttftArr, entry.ttft_ms)
       this.ttftSamples.set(model, ttftArr)
     }
 
@@ -270,22 +328,11 @@ class PerfTracker {
       stats.avgLatency = prev !== null ? prev + (entry.latency_ms - prev) / c : entry.latency_ms
       stats.maxLatency = stats.maxLatency !== null ? Math.max(stats.maxLatency, entry.latency_ms) : entry.latency_ms
       stats.minLatency = stats.minLatency !== null ? Math.min(stats.minLatency, entry.latency_ms) : entry.latency_ms
-      // 收集原始样本用于分位数计算
+      // 收集原始样本用于分位数计算（有界）
       const latArr = this.latencySamples.get(model) ?? []
-      latArr.push(entry.latency_ms)
+      this.pushSample(latArr, entry.latency_ms)
       this.latencySamples.set(model, latArr)
     }
-  }
-
-  /** 计算有序数组的指定百分位数（线性插值法） */
-  private percentile(sortedArr: number[], p: number): number | null {
-    if (sortedArr.length === 0) return null
-    if (sortedArr.length === 1) return sortedArr[0]
-    const idx = (p / 100) * (sortedArr.length - 1)
-    const lo = Math.floor(idx)
-    const hi = Math.ceil(idx)
-    if (lo === hi) return sortedArr[lo]
-    return sortedArr[lo] + (sortedArr[hi] - sortedArr[lo]) * (idx - lo)
   }
 
   getSessionStats(): SessionPerfStats {
@@ -301,16 +348,10 @@ class PerfTracker {
       totalRequests += s.requestCount
       totalCost += s.totalCost
 
-      // 计算每个模型的分位数（需先排序）
-      const ttftArr = [...(this.ttftSamples.get(model) ?? [])].sort((a, b) => a - b)
-      s.p50TTFT = this.percentile(ttftArr, 50)
-      s.p95TTFT = this.percentile(ttftArr, 95)
-      s.p99TTFT = this.percentile(ttftArr, 99)
-
-      const latArr = [...(this.latencySamples.get(model) ?? [])].sort((a, b) => a - b)
-      s.p50Latency = this.percentile(latArr, 50)
-      s.p95Latency = this.percentile(latArr, 95)
-      s.p99Latency = this.percentile(latArr, 99)
+      // 说明：这里刻意不再计算 p50/p95/p99 分位数。
+      // 侧边栏只展示 avgTTFT / recentTPS / avgLatency；分位数仅用于 HTML 报告，
+      // 由 stats-store.readPersistedStats() 负责。此前每次渲染都对全量样本排序，
+      // 是流式期间的 CPU 热点，故移除（分位数字段在会话态保持 null）。
 
       // 滚动"瞬时"TPS：最近 N 次请求的平均，随每次思考变动
       const win = this.tpsWindow.get(model) ?? []
@@ -336,23 +377,8 @@ class PerfTracker {
   }
 
   readLogs(last: number = 50): LogEntry[] {
-    try {
-      if (!existsSync(LOG_PATH)) return []
-      const content = readFileSync(LOG_PATH, "utf-8").trim()
-      if (!content) return []
-      const lines = content.split("\n")
-      const entries: LogEntry[] = []
-      for (let i = Math.max(0, lines.length - last); i < lines.length; i++) {
-        try {
-          entries.push(JSON.parse(lines[i]) as LogEntry)
-        } catch {
-          // Skip malformed lines
-        }
-      }
-      return entries
-    } catch {
-      return []
-    }
+    const entries = this.readLogEntriesSync()
+    return entries.length > last ? entries.slice(entries.length - last) : entries
   }
 
   reset(): void {
@@ -364,35 +390,28 @@ class PerfTracker {
     this.tpsWindow.clear()
   }
 
-  loadSession(sessionID: string): void {
-    this.firstPartTimes.clear()
-    this.statsMap.clear()
-    this.ttftSamples.clear()
-    this.latencySamples.clear()
-    this.reasoningMessages.clear()
-    this.tpsWindow.clear()
-
-    if (!sessionID) return
-
+  /**
+   * 异步载入指定会话的历史性能统计。
+   * 相比旧版同步 loadSession，改为 fs/promises 读取 + mtime 缓存，避免切换会话时
+   * 同步读取整个 JSONL 阻塞 UI 线程；完成后通过 onDone 触发一次重绘。
+   */
+  async loadSessionAsync(sessionID: string, onDone?: () => void): Promise<void> {
+    this.reset()
+    if (!sessionID) {
+      onDone?.()
+      return
+    }
     try {
-      if (!existsSync(LOG_PATH)) return
-      const content = readFileSync(LOG_PATH, "utf-8").trim()
-      if (!content) return
-      const lines = content.split("\n")
-      for (const line of lines) {
-        if (!line) continue
-        try {
-          const entry = JSON.parse(line) as LogEntry
-          if (entry.sessionID === sessionID) {
-            this.updateStats(entry.model, entry)
-          }
-        } catch {
-          // Skip malformed lines
+      const entries = await this.readLogEntriesAsync()
+      for (const entry of entries) {
+        if (entry.sessionID === sessionID) {
+          this.updateStats(entry.model, entry)
         }
       }
     } catch {
       // Non-critical loading failure
     }
+    onDone?.()
   }
 }
 

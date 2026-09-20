@@ -60,23 +60,56 @@ interface StatsFile {
 // 内部 I/O 工具
 // ─────────────────────────────────────────────
 
+// 进程内缓存 + 防抖落盘：
+// 旧实现每次请求都「读整个统计文件 → 改 → 写回」，文件越大每次响应越慢。
+// 现在统计文件只在进程内维护一份，写入合并为最多每 800ms 一次。
+let cachedFile: StatsFile | null = null
+let dirty = false
+let flushTimer: ReturnType<typeof setTimeout> | null = null
+
 function loadStatsFile(): StatsFile {
+  if (cachedFile) return cachedFile
   try {
-    if (!existsSync(STATS_PATH)) {
-      return { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
+    if (existsSync(STATS_PATH)) {
+      const content = readFileSync(STATS_PATH, "utf-8")
+      const parsed = JSON.parse(content) as StatsFile
+      if (parsed?.version === CURRENT_VERSION && parsed.models) {
+        cachedFile = parsed
+        return cachedFile
+      }
     }
-    const content = readFileSync(STATS_PATH, "utf-8")
-    const parsed = JSON.parse(content) as StatsFile
-    if (parsed?.version === CURRENT_VERSION && parsed.models) return parsed
   } catch { /* 文件损坏时返回空白统计 */ }
-  return { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
+  cachedFile = { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
+  return cachedFile
 }
 
-function saveStatsFile(file: StatsFile): void {
+/** 立即落盘（仅在 dirty 时）。 */
+function flushStatsFile(): void {
+  if (!cachedFile || !dirty) return
+  dirty = false
   try {
-    file.updatedAt = new Date().toISOString()
-    writeFileSync(STATS_PATH, JSON.stringify(file), "utf-8")
+    cachedFile.updatedAt = new Date().toISOString()
+    writeFileSync(STATS_PATH, JSON.stringify(cachedFile), "utf-8")
   } catch { /* 写入失败不影响主流程 */ }
+}
+
+/** 标记脏并安排一次防抖落盘。 */
+function scheduleFlush(): void {
+  dirty = true
+  if (flushTimer) return
+  flushTimer = setTimeout(() => {
+    flushTimer = null
+    flushStatsFile()
+  }, 800)
+  ;(flushTimer as any).unref?.()
+}
+
+/** 仅供测试/诊断：丢弃进程内缓存（下次读取重新从磁盘加载）。 */
+export function resetStatsCache(): void {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null }
+  flushStatsFile()
+  cachedFile = null
+  dirty = false
 }
 
 // ─────────────────────────────────────────────
@@ -259,11 +292,8 @@ export function updatePersistedStats(entry: LogEntry): void {
   try {
     const file = loadStatsFile()
     applyEntryToModels(file.models, entry)
-    // 如果尚未完成迁移，先标记（避免 readPersistedStats 再重复迁移后与当前增量数据合并）
-    // 实际上：首次有请求时 migratedFromLogs 必然为 false，
-    // 所以 readPersistedStats 首次被调用时会重建全量历史，覆盖这个增量写入。
-    // 这是可接受的：迁移完成后统计文件是完整的（含本条目，因为 JSONL 已先写入）。
-    saveStatsFile(file)
+    // 只改内存 + 标记脏，实际写盘由防抖合并（避免每次请求都同步读写整个文件）
+    scheduleFlush()
   } catch { /* 统计写入失败不影响主流程 */ }
 }
 
@@ -280,7 +310,8 @@ export function readPersistedStats(): ModelPerfStats[] {
     if (!file.migratedFromLogs) {
       file.models = {}  // 清空，让迁移从零开始重建
       migrateFromLogsIfNeeded(file)
-      saveStatsFile(file)
+      dirty = true
+      flushStatsFile()
     }
 
     return Object.values(file.models).map(s => {

@@ -24,7 +24,8 @@ A live sidebar dashboard for the OpenCode TUI that lets you **see** your token c
 - 📈 **报告导出** — HTML / JSON / Markdown 一键生成,数据落盘 `~/.opencode/reports/` / One-click HTML/JSON/Markdown reports
 - 💰 **Go 余额查询** — 查询 OpenCode Go 套餐余量 / Check your OpenCode Go plan balance
 - 🔔 **版本更新提示** — 启动时检查 npm 新版本，侧边栏 + Toast 提示并可一键升级 / Update check with in-TUI upgrade
-- 🖥️ **Windows 桌面权限弹窗** — AI 请求权限时右下角弹窗,可远程批准/拒绝 / Native Windows permission toast with allow/deny buttons
+- 🖥️ **桌面权限弹窗（跨平台）** — AI 请求权限时右下角弹窗,可远程批准/拒绝（Windows WinForms / macOS AppleScript / Linux 通知兜底）/ Cross-platform permission toast with allow/deny buttons
+- ⚡ **事件驱动,零轮询** — 权限批准用 `fs.watch`、配置变更用进程内发布订阅、历史消息用事件 + 有界退避重试,不再有常驻定时器 / Event-driven, no polling timers
 - 🧩 **兼容 OpenCode 与 Mimo Code** — 同一插件,双端可用 / Works with both OpenCode and Mimo Code
 
 本项目基于 [opencode-token-watch](https://github.com/Howardzhangdqs/opencode-token-watch) 修改而来,特此鸣谢原项目作者。
@@ -135,12 +136,53 @@ rm -rf ~/.cache/opencode/packages/opencode-token-board@latest
 
 - OpenCode CLI（支持 `opencode db` 命令）
 - Node.js 18+
+- 操作系统：Windows / macOS / Linux
+
+## 跨平台支持
+
+| 能力 | Windows | macOS | Linux |
+|------|---------|-------|-------|
+| 侧边栏面板 / 报告 / Go 用量 | ✅ | ✅ | ✅ |
+| 浏览器打开报告 | ✅ `start` | ✅ `open` | ✅ `xdg-open` |
+| 会话结束桌面提示 | ✅ WinForms | ✅ `osascript display notification` | ✅ `notify-send` |
+| 权限弹窗（可批准/拒绝） | ✅ WinForms 三按钮 | ✅ `osascript display dialog` 三按钮 | ✅ `zenity` 三按钮（缺 zenity 时退化为通知） |
+
+说明：
+
+- **凭据/配置路径全平台一致**：opencode 在三大平台都按 XDG 约定读取
+  `~/.local/share/opencode/auth.json` 与 `~/.config/opencode/opencode.json[c]`
+  （除非显式设置了 `XDG_DATA_HOME` / `XDG_CONFIG_HOME`），插件据此自动发现 Go API Key。
+- **macOS 权限弹窗**：通过 `osascript` 弹出系统对话框，点按后由 AppleScript 写入与
+  Windows 完全相同的批准标记文件（`~/.opencode/tokenwatch-approvals/<id>.<reply>`），
+  因此批准链路无需额外改动。
+- **Linux 权限弹窗**：通过 `zenity --question --switch` + 三个 `--extra-button` 提供三按钮，
+  点按的按钮文案由 stdout 返回、据此写入批准标记；未安装 zenity 时退化为 `notify-send`
+  通知，直接在 TUI 内回复即可。
+
+> 在 Windows 上无法执行 `osascript` / `notify-send`，因此 macOS/Linux 分支通过
+> 「生成脚本字符串 + 断言」的方式做单元校验（`npm run test:popup` 覆盖 AppleScript
+> 生成、转义、按钮顺序与标记路径），并配合 `tsc` 类型检查；真机行为仍需在对应系统上冒烟。
+
+## 性能设计
+
+插件刻意避免常驻轮询与同步阻塞 I/O：
+
+- **权限批准**：`fs.watch` 监听批准目录（仅在有待审批请求时开启），取代旧的 300ms 轮询。
+- **配置变更**：进程内发布订阅（`config-store.ts`），取代旧的 500ms kv 版本轮询。
+- **历史消息加载**：打开会话时立即读一次，为空则按 250/500/1000/2000/3000ms 有界退避重试，
+  并在 `message.updated` / `session.idle` 事件到达时提前结束；取代旧的 200ms×50 轮询。
+- **会话性能统计**：改为异步读 JSONL（`fs/promises` + mtime 缓存），不再在切换会话时同步
+  读取整个日志文件阻塞 UI。
+- **持久化统计**：内存维护单份统计，写入防抖合并（≤800ms 一次），不再每条消息都同步读写整个文件。
+- **渲染节流**：流式期间 `message.part.updated` 高频触发，面板重算节流为最多约 4 次/秒；
+  分位数只在生成报告时计算，侧边栏渲染不再对全量样本排序。
 
 ## 构建
 
 ```sh
 npm install
 npm run build
+npm run test:popup   # 弹窗脚本 + 跨平台脚本生成断言
 ```
 
 ## 插件安装、更新与排障指南（经验文档）
@@ -249,7 +291,7 @@ OpenCode/MiMoCode 的插件 spec 判定逻辑（`Jq()`）只认三种"本地路�
    ```
 3. 检查缓存包是否包含期望的新逻辑（如权限弹窗函数）：
    ```sh
-   grep -c "notifyPermissionWindows" ~/.cache/opencode/packages/opencode-token-board@latest/node_modules/opencode-token-board/dist/tui.js
+   grep -c "macPermissionScript" ~/.cache/opencode/packages/opencode-token-board@latest/node_modules/opencode-token-board/dist/tui.js
    ```
 
 #### 解决方案
@@ -275,10 +317,10 @@ OpenCode/MiMoCode 的插件 spec 判定逻辑（`Jq()`）只认三种"本地路�
 ```
 AI 请求权限 → OpenCode 发出 permission.asked 事件
   → TUI 插件 api.event.on("permission.asked") 捕获
-  → notify.ts 通过 wscript 拉起独立 PowerShell WinForms 弹窗（右下角）
+  → notify.ts 拉起独立桌面弹窗（Windows: wscript+PowerShell WinForms / macOS: osascript display dialog）
   → 用户点击"允许一次/总是允许/拒绝"
-  → 写入 ~/.opencode/tokenwatch-approvals/<requestID>.<reply> 标记文件
-  → 插件轮询目录 → api.client.permission.reply() 放行/拒绝
+  → 弹窗进程写入 ~/.opencode/tokenwatch-approvals/<requestID>.<reply> 标记文件
+  → 插件用 fs.watch 监听该目录（仅在有待审批请求时开启）→ api.client.permission.reply() 放行/拒绝
 ```
 
 #### 1. 事件名：`permission.asked` 是对的
@@ -384,7 +426,7 @@ MiMoCode 的插件加载机制与 OpenCode 完全一致（缓存目录为
 4. 验证缓存版本与内容：
    ```sh
    grep '"version"' ~/.cache/mimocode/packages/opencode-token-board@latest/node_modules/opencode-token-board/package.json
-   grep -c "notifyPermissionWindows" ~/.cache/mimocode/packages/opencode-token-board@latest/node_modules/opencode-token-board/dist/tui.js
+   grep -c "macPermissionScript" ~/.cache/mimocode/packages/opencode-token-board@latest/node_modules/opencode-token-board/dist/tui.js
    ```
 5. 重启 MiMoCode 生效。
 

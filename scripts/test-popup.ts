@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process"
 import { writeFileSync } from "node:fs"
-import { popupScript } from "../src/notify.js"
+import { popupScript, macNotifyScript, macPermissionScript, linuxNotifyArgs, linuxPermissionPlan, linuxReplyFromButton } from "../src/notify.js"
 
 let failures = 0
 function check(name, cond, detail = "") {
@@ -83,6 +83,61 @@ const ps = spawnSync("powershell.exe", [
   `$errs = $null; [System.Management.Automation.PSParser]::Tokenize((Get-Content '${psFile}' -Raw), [ref]$errs) | Out-Null; if ($errs.Count -eq 0) { 'SYNTAX_OK' } else { $errs | ForEach-Object { $_.Message }; exit 1 }`,
 ], { encoding: "utf8" })
 check("PSParser 语法无错误", ps.stdout.includes("SYNTAX_OK"), ps.stdout + ps.stderr)
+
+// ── 跨平台脚本生成（无法在 Windows 执行 osascript，但可校验生成结果）──
+console.log("== macOS AppleScript 生成 ==")
+const macNotify = macNotifyScript('标题"x', "消息\\y")
+check("含 display notification", macNotify.includes("display notification"))
+check("双引号转义", macNotify.includes('\\"'))
+check("反斜杠转义", macNotify.includes("\\\\"))
+
+const macPerm = macPermissionScript({
+  requestID: "per_1",
+  title: "t",
+  message: "m",
+  allowOnceLabel: "允许一次",
+  alwaysLabel: "总是允许",
+  rejectLabel: "拒绝",
+  pid: 123,
+})
+check("含 display dialog", macPerm.includes("display dialog"))
+check("三按钮顺序", macPerm.includes('buttons {"允许一次", "总是允许", "拒绝"}'))
+check("默认按钮 1", macPerm.includes("default button 1"))
+check("once 标记写入", macPerm.includes(".once'"))
+check("always 标记写入", macPerm.includes(".always'"))
+check("reject 标记写入", macPerm.includes(".reject'"))
+check("写入 approvals 目录", macPerm.includes("tokenwatch-approvals"))
+check("if/else-if 分支", macPerm.includes("else if theReply is"))
+check("do shell script 落盘", macPerm.includes("do shell script"))
+
+console.log("== Linux notify-send 参数 ==")
+const lin = linuxNotifyArgs("标题", "消息")
+check("两个参数", lin.length === 2 && lin[0] === "标题" && lin[1] === "消息")
+
+console.log("== Linux zenity 三按钮 ==")
+const linInput = {
+  requestID: "per_9",
+  title: "t",
+  message: "m",
+  allowOnceLabel: "允许一次",
+  alwaysLabel: "总是允许",
+  rejectLabel: "拒绝",
+  pid: 1,
+}
+const zp = linuxPermissionPlan(linInput)
+check("命令为 zenity", zp.command === "zenity")
+check("--switch 抑制默认按钮", zp.args.includes("--switch"))
+check("三个 --extra-button", (zp.args.filter((a) => a === "--extra-button")).length === 3)
+const ai = zp.args.indexOf("允许一次")
+const bi = zp.args.indexOf("总是允许")
+const ci = zp.args.indexOf("拒绝")
+check("按钮文案顺序", ai > 0 && ai < bi && bi < ci, `${ai},${bi},${ci}`)
+check("--question 模式", zp.args.includes("--question"))
+check("点击 允许一次 → once", linuxReplyFromButton("允许一次", linInput) === "once")
+check("点击 总是允许 → always", linuxReplyFromButton("总是允许", linInput) === "always")
+check("点击 拒绝 → reject", linuxReplyFromButton("拒绝", linInput) === "reject")
+check("空输出（Esc/关窗）→ null", linuxReplyFromButton("\n", linInput) === null)
+check("未知文案 → null", linuxReplyFromButton("whatever", linInput) === null)
 
 console.log(`\n${failures === 0 ? "ALL TESTS PASSED" : failures + " TEST(S) FAILED"}`)
 process.exit(failures === 0 ? 0 : 1)
