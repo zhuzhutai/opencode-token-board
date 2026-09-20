@@ -7,6 +7,7 @@ import type { PerfTracker } from "./perf-tracker.js"
 import type { TokenMessage } from "./tui.js"
 import type { GoUsageData } from "./formatter.js"
 import type { GoUsageFetcher } from "./go-usage.js"
+import type { UpdateChecker } from "./update-check.js"
 
 /**
  * ══════════════════════════════════════════════════════════════════
@@ -69,7 +70,7 @@ export interface SidebarConfig {
     showGoUsage: boolean
   }
   language: "zh" | "en" | "auto"
-  go?: { workspaceID?: string; cookie?: string }
+  go?: { apiKey?: string }
 }
 
 const DEFAULT_CONFIG: SidebarConfig = {
@@ -210,7 +211,7 @@ function saveCollapseState(api: TuiPluginApi, state: CollapseState): void {
 }
 
 export function loadConfig(api: TuiPluginApi): SidebarConfig {
-  const base = { sidebar: { ...DEFAULT_CONFIG.sidebar }, language: DEFAULT_CONFIG.language, go: {} as { workspaceID?: string; cookie?: string } }
+  const base = { sidebar: { ...DEFAULT_CONFIG.sidebar }, language: DEFAULT_CONFIG.language, go: {} as { apiKey?: string } }
   try {
     const pluginCfg = (api as any).config?.pluginConfig?.["opencode-token-board"]
     if (pluginCfg?.sidebar) Object.assign(base.sidebar, pluginCfg.sidebar)
@@ -245,6 +246,7 @@ interface TokenWatchPanelProps {
   messages: () => readonly any[]
   allTokenMessages: () => TokenMessage[]
   goUsageFetcher?: GoUsageFetcher
+  updateChecker?: UpdateChecker
 }
 
 export function TokenWatchPanel(props: TokenWatchPanelProps) {
@@ -265,17 +267,13 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
   // 检测是否是纯英文标签，用于全大写转换
   const isEnglish = (str: string) => /^[a-zA-Z\s\.\/]+$/.test(str)
 
-  // Go 配置变更时同步到 fetcher（触发立即刷新）
-  let lastGoWs = ""
-  let lastGoCookie = ""
+  // Go 配置（API Key）变更时同步到 fetcher（触发立即刷新）
+  let lastGoKey = ""
   const syncGoConfig = () => {
-    const g = config().go
-    const ws = g?.workspaceID ?? ""
-    const ck = g?.cookie ?? ""
-    if (ws && ck && (ws !== lastGoWs || ck !== lastGoCookie)) {
-      lastGoWs = ws
-      lastGoCookie = ck
-      props.goUsageFetcher?.setConfig(ws, ck)
+    const key = config().go?.apiKey ?? ""
+    if (key !== lastGoKey) {
+      lastGoKey = key
+      props.goUsageFetcher?.setConfig(key)
     }
   }
   syncGoConfig()
@@ -319,8 +317,19 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
     void goUsageVersion()
     return props.goUsageFetcher?.data() ?? null
   })
-  // Go 是否已配置（有 workspace + cookie）→ 决定区块是否显示
-  const goConfigured = () => !!config().go?.workspaceID && !!config().go?.cookie
+  // Go 是否可用（显式 API Key 或自动从 OpenCode 凭据解析到）→ 决定区块是否显示
+  const goConfigured = () => props.goUsageFetcher?.configured() ?? false
+
+  // ── 插件更新提示（有新版本时在面板底部显示一行，点击打开 /usage 菜单）──
+  const [updateVersion, setUpdateVersion] = createSignal(0)
+  onMount(() => {
+    const unsub = props.updateChecker?.subscribe(() => setUpdateVersion(v => v + 1))
+    onCleanup(() => { try { unsub?.() } catch { } })
+  })
+  const updateInfo = createMemo(() => {
+    void updateVersion()
+    return props.updateChecker?.info() ?? null
+  })
 
   const goRows = createMemo(() => {
     const iconW = 2 // 🕔📅🌙 均为 2 宽 + 1 空格，固定 icon 列保证各行对齐
@@ -829,6 +838,15 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
                 </Show>
               </box>
             </Show>
+          </box>
+        </Show>
+
+        {/* 插件更新提示：有新版时显示一行，点击打开 /usage 菜单 */}
+        <Show when={updateInfo()}>
+          <box marginTop={1} paddingX={1} onMouseDown={() => api.command?.trigger?.("tokenwatch-usage")}>
+            <text fg={theme.current.warning}>
+              {`⬆ ${t("updateAvailable")} v${updateInfo()!.latest} · /usage`}
+            </text>
           </box>
         </Show>
 

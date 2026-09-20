@@ -7,6 +7,7 @@ import { generateUsageHtml } from "./generate-usage-html.js"
 import { t, setLanguage } from "./i18n.js"
 import type { SupportedLanguage } from "./i18n.js"
 import type { SidebarConfig } from "./sidebar.js"
+import type { UpdateChecker } from "./update-check.js"
 import { readLogs } from "./perf-tracker.js"
 import type { LogEntry, ModelPerfStats } from "./formatter.js"
 import { readPersistedStats } from "./stats-store.js"
@@ -20,7 +21,7 @@ const DEFAULT_CONFIG: SidebarConfig = {
   language: "auto",
 }
 
-export async function registerCommands(api: TuiPluginApi): Promise<void> {
+export async function registerCommands(api: TuiPluginApi, updateChecker?: UpdateChecker): Promise<void> {
   api.command?.register(() => [
     {
       value: "tokenwatch-usage",
@@ -29,7 +30,7 @@ export async function registerCommands(api: TuiPluginApi): Promise<void> {
       category: "Stats",
       slash: { name: "usage" },
       onSelect: async (dialog) => {
-        if (dialog) showUsageMenu(api, dialog)
+        if (dialog) showUsageMenu(api, dialog, updateChecker)
       },
     },
   ])
@@ -278,8 +279,9 @@ function showHtmlReportRangeMenu(api: TuiPluginApi, dialog: TuiDialogStack): voi
   ))
 }
 
-function showUsageMenu(api: TuiPluginApi, dialog: TuiDialogStack): void {
+function showUsageMenu(api: TuiPluginApi, dialog: TuiDialogStack, updateChecker?: UpdateChecker): void {
   try { setLanguage(loadConfigFromStore(api).language) } catch {}
+  const update = updateChecker?.info() ?? null
   dialog.replace(() => (
     <api.ui.DialogSelect
       title={t("panelTitle")}
@@ -309,9 +311,67 @@ function showUsageMenu(api: TuiPluginApi, dialog: TuiDialogStack): void {
           description: t("cmdDescSettings"),
           onSelect: () => showSettingsDialog(api, dialog),
         },
+        {
+          title: update ? `${t("cmdTitleUpdate")} ⬆ v${update.latest}` : t("cmdTitleUpdate"),
+          value: "update",
+          description: update ? t("cmdDescUpdateNew").replace("{ver}", update.latest) : t("cmdDescUpdate"),
+          onSelect: () => { if (updateChecker) showUpdateMenu(api, dialog, updateChecker) },
+        },
       ]}
       flat={true}
     />
+  ))
+}
+
+function showUpdateMenu(api: TuiPluginApi, dialog: TuiDialogStack, checker: UpdateChecker): void {
+  try { setLanguage(loadConfigFromStore(api).language) } catch {}
+  const info = checker.info()
+  const options: Array<{ title: string; value: string; description?: string; onSelect?: () => void }> = []
+
+  if (info) {
+    options.push({
+      title: `${t("updateNow")} → v${info.latest}`,
+      value: "install",
+      description: `${t("updateCurrent")}: v${info.current}`,
+      onSelect: () => {
+        dialog.clear()
+        api.ui.toast?.({ message: t("updateInstalling"), variant: "info" })
+        void checker.install().then((res) => {
+          if (res.ok) {
+            api.ui.toast?.({ message: t("updateInstalled").replace("{ver}", res.message), variant: "success", duration: 10000 })
+          } else {
+            const detail = res.message === "local-source" ? t("updateLocalHint") : res.message
+            api.ui.toast?.({ message: `${t("updateFailed")}: ${detail}`, variant: "error", duration: 10000 })
+          }
+        })
+      },
+    })
+    options.push({
+      title: t("updateIgnore"),
+      value: "dismiss",
+      onSelect: () => { checker.dismiss(); showUsageMenu(api, dialog, checker) },
+    })
+  } else {
+    options.push({
+      title: `${t("updateUpToDate")} · v${checker.current()}`,
+      value: "uptodate",
+      onSelect: () => dialog.clear(),
+    })
+  }
+
+  options.push({
+    title: t("updateRecheck"),
+    value: "recheck",
+    onSelect: () => {
+      checker.check(true)
+      api.ui.toast?.({ message: t("updateChecking"), variant: "info" })
+      setTimeout(() => showUpdateMenu(api, dialog, checker), 1500)
+    },
+  })
+  options.push({ title: t("done"), value: "done", onSelect: () => dialog.clear() })
+
+  dialog.replace(() => (
+    <api.ui.DialogSelect title={t("checkUpdate")} placeholder={t("checkUpdate")} options={options} flat={true} />
   ))
 }
 
@@ -353,11 +413,10 @@ function bumpConfigVersion(api: TuiPluginApi): void {
   api.kv?.set?.("tokenwatch-config-version", v)
 }
 
-function saveGoField(api: TuiPluginApi, field: "workspaceID" | "cookie", value: string): void {
+function saveGoKey(api: TuiPluginApi, value: string): void {
   const current = loadConfigFromStore(api)
-  const go: { workspaceID?: string; cookie?: string } = { ...(current.go ?? {}) }
-  if (field === "workspaceID") go.workspaceID = value
-  else go.cookie = value
+  const go: { apiKey?: string } = { ...(current.go ?? {}) }
+  go.apiKey = value
   current.go = go
   saveConfigToStore(api, current)
   bumpConfigVersion(api)
@@ -370,17 +429,16 @@ function clearGoConfig(api: TuiPluginApi): void {
   bumpConfigVersion(api)
 }
 
-function promptGoField(api: TuiPluginApi, dialog: TuiDialogStack, field: "workspaceID" | "cookie"): void {
+function promptGoKey(api: TuiPluginApi, dialog: TuiDialogStack): void {
   const cfg = loadConfigFromStore(api)
-  const current = (cfg.go ?? {})[field] ?? ""
-  const isWs = field === "workspaceID"
+  const current = cfg.go?.apiKey ?? ""
   dialog.replace(() => (
     <api.ui.DialogPrompt
-      title={isWs ? t("goWorkspaceId") : t("goCookie")}
-      placeholder={isWs ? "wrk_xxx" : ""}
+      title={t("goApiKey")}
+      placeholder="sk-..."
       value={current}
       onConfirm={(v) => {
-        saveGoField(api, field, v.trim())
+        saveGoKey(api, v.trim())
         showGoConfigMenu(api, dialog)
       }}
       onCancel={() => showGoConfigMenu(api, dialog)}
@@ -397,14 +455,10 @@ function showGoConfigMenu(api: TuiPluginApi, dialog: TuiDialogStack): void {
       placeholder={t("descGoConfig")}
       options={[
         {
-          title: `${go.workspaceID ? "✓ " : "  "}${t("setWorkspaceId")}${go.workspaceID ? " · " + go.workspaceID : ""}`,
-          value: "workspaceID",
-          onSelect: () => promptGoField(api, dialog, "workspaceID"),
-        },
-        {
-          title: `${go.cookie ? "✓ " : "  "}${t("setCookie")}`,
-          value: "cookie",
-          onSelect: () => promptGoField(api, dialog, "cookie"),
+          title: `${go.apiKey ? "✓ " : "  "}${t("setApiKey")}`,
+          value: "apiKey",
+          description: t("goApiKeyHint"),
+          onSelect: () => promptGoKey(api, dialog),
         },
         {
           title: t("clearGoConfig"),
@@ -530,7 +584,7 @@ function toggleSidebarSetting(api: TuiPluginApi, key: keyof SidebarConfig["sideb
 }
 
 function loadConfigFromStore(api: TuiPluginApi): SidebarConfig {
-  const base = { sidebar: { ...DEFAULT_CONFIG.sidebar }, language: DEFAULT_CONFIG.language, go: {} as { workspaceID?: string; cookie?: string } }
+  const base = { sidebar: { ...DEFAULT_CONFIG.sidebar }, language: DEFAULT_CONFIG.language, go: {} as { apiKey?: string } }
   try {
     const stored = api.kv?.get?.("tokenwatch-config") as Partial<SidebarConfig> | undefined
     if (stored) {

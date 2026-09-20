@@ -3,11 +3,13 @@ import { createSignal, createEffect, onCleanup } from "solid-js"
 import type { TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { readFileSync, readdirSync, unlinkSync } from "node:fs"
+import { readdirSync, unlinkSync } from "node:fs"
 import { registerCommands } from "./commands.js"
 import { createPerfTracker } from "./perf-tracker.js"
 import { createGoUsageFetcher } from "./go-usage.js"
 import type { GoUsageFetcher } from "./go-usage.js"
+import { createUpdateChecker } from "./update-check.js"
+import type { UpdateChecker } from "./update-check.js"
 import { notifyWindows, notifyPermissionWindows } from "./notify.js"
 import { TokenWatchPanel } from "./sidebar.js"
 import { t } from "./i18n.js"
@@ -31,32 +33,42 @@ function kvKey(sessionID: string): string {
 
 const approvalDirectory = join(homedir(), ".opencode", "tokenwatch-approvals")
 
-const tui: TuiPluginModule["tui"] = async (api) => {
+const tui: TuiPluginModule["tui"] = async (api, _options, meta) => {
   const perfTracker = createPerfTracker()
   const goUsageFetcher: GoUsageFetcher = createGoUsageFetcher()
+  const updateChecker: UpdateChecker = createUpdateChecker(api, meta)
   const [sidebarRevision, setSidebarRevision] = createSignal(0)
   const [allTokenMessages, setAllTokenMessages] = createSignal<TokenMessage[]>([])
   let currentSlotSessionID = ""
   const cleanups: (() => void)[] = []
 
-  registerCommands(api)
+  registerCommands(api, updateChecker)
+
+  // 版本检查：发现新版本时弹一次 Toast（同一版本只提示一次）
+  const notifiedVersions = new Set<string>()
+  updateChecker.subscribe(() => {
+    const info = updateChecker.info()
+    if (info && !notifiedVersions.has(info.latest)) {
+      notifiedVersions.add(info.latest)
+      api.ui.toast?.({
+        variant: "info",
+        title: t("updateToastTitle"),
+        message: t("updateToastBody").replace("{latest}", info.latest).replace("{current}", info.current),
+        duration: 10000,
+      })
+    }
+  })
+  // 延迟到界面就绪后检查，避免阻塞启动
+  setTimeout(() => { try { updateChecker.check() } catch { /* ignore */ } }, 1500)
 
   function loadGoConfig(): void {
+    // 新版仅需 Go API Key：显式配置为空时由 fetcher 自动从 OpenCode 凭据中解析
     try {
-      const cfg = api.kv?.get?.("tokenwatch-config") as { go?: { workspaceID?: string; cookie?: string } } | undefined
-      if (cfg?.go?.workspaceID && cfg?.go?.cookie) {
-        goUsageFetcher.setConfig(cfg.go.workspaceID, cfg.go.cookie)
-        return
-      }
-    } catch { /* 忽略，尝试 fallback */ }
-    // 复用 opencode-go-usage 插件的配置，避免重复填 Cookie
-    try {
-      const cfgFile = join(homedir(), ".config", "opencode", "opencode-go-usage.json")
-      const raw = JSON.parse(readFileSync(cfgFile, "utf-8")) as { workspaceId?: string; authCookie?: string }
-      if (raw?.workspaceId && raw?.authCookie) {
-        goUsageFetcher.setConfig(raw.workspaceId, raw.authCookie)
-      }
-    } catch { /* 无配置文件则不启用 */ }
+      const cfg = api.kv?.get?.("tokenwatch-config") as { go?: { apiKey?: string } } | undefined
+      goUsageFetcher.setConfig(cfg?.go?.apiKey ?? "")
+    } catch {
+      goUsageFetcher.setConfig("")
+    }
   }
   loadGoConfig()
 
@@ -309,7 +321,7 @@ const tui: TuiPluginModule["tui"] = async (api) => {
           })
         })
 
-        return <TokenWatchPanel api={api} theme={api.theme} perfTracker={perfTracker} messages={() => api.state.session.messages(session_id)} allTokenMessages={allTokenMessages} goUsageFetcher={goUsageFetcher} />
+        return <TokenWatchPanel api={api} theme={api.theme} perfTracker={perfTracker} messages={() => api.state.session.messages(session_id)} allTokenMessages={allTokenMessages} goUsageFetcher={goUsageFetcher} updateChecker={updateChecker} />
       },
     },
   })

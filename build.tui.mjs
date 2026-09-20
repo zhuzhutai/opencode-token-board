@@ -1,5 +1,8 @@
 import { build } from "esbuild"
 import { solidPlugin } from "esbuild-plugin-solid"
+import { readFileSync } from "node:fs"
+
+const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf-8"))
 
 /**
  * esbuild build script for opencode-token-board TUI plugin.
@@ -42,6 +45,7 @@ await Promise.all([
     ...common,
     entryPoints: ["src/tui.tsx"],
     outfile: "dist/tui.js",
+    define: { __PLUGIN_VERSION__: JSON.stringify(pkg.version) },
     plugins: [solidPlugin({
       solid: { moduleName: "@opentui/solid", generate: "universal" },
     })],
