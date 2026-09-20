@@ -1,7 +1,7 @@
 import type { TuiDialogStack, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { getUsageReport, getPresetRange } from "./queries.js"
 import type { UsageFilters } from "./formatter.js"
-import { formatUsageReport } from "./formatter.js"
+import { formatUsageReport, computeTps } from "./formatter.js"
 import type { CombinedReportData, HtmlReportMeta } from "./formatter.js"
 import { generateUsageHtml } from "./generate-usage-html.js"
 import { t, setLanguage } from "./i18n.js"
@@ -81,6 +81,7 @@ function aggregatePerfStats(logs: LogEntry[]): ModelPerfStats[] {
         avgTTFT: null, maxTTFT: null, minTTFT: null,
         p50TTFT: null, p95TTFT: null, p99TTFT: null,
         avgTPS: null, maxTPS: null, minTPS: null,
+        recentTPS: null,
         avgLatency: null, maxLatency: null, minLatency: null,
         p50Latency: null, p95Latency: null, p99Latency: null,
         cacheHitRate: null,
@@ -102,13 +103,21 @@ function aggregatePerfStats(logs: LogEntry[]): ModelPerfStats[] {
       s.maxTTFT = s.maxTTFT != null ? Math.max(s.maxTTFT, entry.ttft_ms) : entry.ttft_ms
       s.minTTFT = s.minTTFT != null ? Math.min(s.minTTFT, entry.ttft_ms) : entry.ttft_ms
     }
-    if (entry.tps != null) {
+    // 新日志信任 tracker 的 tps；旧日志（无 reasoningStreamed）按新口径重算
+    let tps: number | null = entry.tps
+    if (entry.reasoningStreamed === undefined) {
+      const genMs = entry.latency_ms != null && entry.ttft_ms != null
+        ? entry.latency_ms - entry.ttft_ms
+        : null
+      tps = computeTps(entry.outputTokens, entry.reasoningTokens, genMs) ?? entry.tps
+    }
+    if (tps != null) {
       // Bug fix: 分母使用 tpsCount（有效样本数）
       s.tpsCount++
       const c = s.tpsCount
-      s.avgTPS = s.avgTPS != null ? s.avgTPS + (entry.tps - s.avgTPS) / c : entry.tps
-      s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, entry.tps) : entry.tps
-      s.minTPS = s.minTPS != null ? Math.min(s.minTPS, entry.tps) : entry.tps
+      s.avgTPS = s.avgTPS != null ? s.avgTPS + (tps - s.avgTPS) / c : tps
+      s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, tps) : tps
+      s.minTPS = s.minTPS != null ? Math.min(s.minTPS, tps) : tps
     }
     if (entry.latency_ms != null) {
       s.latencyCount++

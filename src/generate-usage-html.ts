@@ -36,15 +36,15 @@ function renderKpiCards(data: CombinedReportData): string {
   const s = data.summary
   const hitRate = cacheHitRate(s.inputTokens, s.cacheRead)
   const hitRatePct = fmtPercent(hitRate)
-  let tpsSum = 0, tpsReqs = 0;
+  let tpsSum = 0, tpsSamples = 0;
   for (const p of data.perfSummary) {
-    if (p.avgTPS != null && p.avgTPS > 0) {
-      tpsSum += p.avgTPS * p.requestCount;
-      tpsReqs += p.requestCount;
+    if (p.avgTPS != null && p.avgTPS > 0 && p.tpsCount > 0) {
+      tpsSum += p.avgTPS * p.tpsCount;
+      tpsSamples += p.tpsCount;
     }
   }
-  const avgTpsRaw = tpsReqs > 0 ? tpsSum / tpsReqs : 0
-  const avgTps = tpsReqs > 0 ? avgTpsRaw.toFixed(1) : '—'
+  const avgTpsRaw = tpsSamples > 0 ? tpsSum / tpsSamples : 0
+  const avgTps = tpsSamples > 0 ? avgTpsRaw.toFixed(1) : '—'
   const isHighCache = hitRate >= 0.5
 
   const errors = (data as any).errors as { errorRate: number; failedCount: number } | undefined
@@ -359,18 +359,18 @@ function renderProviderCards(data: CombinedReportData): string {
     const perfItems = data.perfSummary.filter(ps => ps.providerID === p.provider)
     let ttftSum = 0, ttftReqs = 0;
     for (const x of perfItems) {
-      if (x.avgTTFT != null && x.avgTTFT > 0) {
-        ttftSum += x.avgTTFT * x.requestCount;
-        ttftReqs += x.requestCount;
+      if (x.avgTTFT != null && x.avgTTFT > 0 && x.ttftCount > 0) {
+        ttftSum += x.avgTTFT * x.ttftCount;
+        ttftReqs += x.ttftCount;
       }
     }
     const avgTtft = ttftReqs > 0 ? ttftSum / ttftReqs : null;
 
     let tpsSum = 0, tpsReqs = 0;
     for (const x of perfItems) {
-      if (x.avgTPS != null && x.avgTPS > 0) {
-        tpsSum += x.avgTPS * x.requestCount;
-        tpsReqs += x.requestCount;
+      if (x.avgTPS != null && x.avgTPS > 0 && x.tpsCount > 0) {
+        tpsSum += x.avgTPS * x.tpsCount;
+        tpsReqs += x.tpsCount;
       }
     }
     const avgTps = tpsReqs > 0 ? tpsSum / tpsReqs : null;

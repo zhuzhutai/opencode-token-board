@@ -122,6 +122,29 @@ export function formatDuration(ms: number | null): string {
   return `${m}m ${s}s`
 }
 
+/**
+ * 计算生成吞吐（TPS / tokens per second）。
+ *
+ * 关键点：opencode 的 `tokens.output` 不包含 `tokens.reasoning`（两者互斥，
+ * 见 message.tokens.total = input + output + reasoning + cache.read + cache.write）。
+ * 但推理 token 与可见输出是在同一个流式窗口内生成的，因此分母（genMs）已包含
+ * 推理耗时。若分子只取 output，会系统性低估真实生成速度。
+ *
+ * @param outputTokens    可见输出 token 数
+ * @param reasoningTokens 推理 token 数（仅当确实流式生成时才应计入）
+ * @param genMs           生成窗口时长（首个 token 到消息完成），毫秒
+ */
+export function computeTps(
+  outputTokens: number,
+  reasoningTokens: number,
+  genMs: number | null,
+): number | null {
+  if (genMs === null || genMs <= 0) return null
+  const generated = outputTokens + reasoningTokens
+  if (generated <= 0) return null
+  return (generated / genMs) * 1000
+}
+
 export function formatFilters(filters: UsageFilters): string {
   const parts: string[] = []
   if (filters.sessionId) parts.push(`session=${filters.sessionId}`)
@@ -443,6 +466,11 @@ export interface ModelPerfStats {
   avgTPS: number | null
   maxTPS: number | null
   minTPS: number | null
+  /**
+   * 最近若干次请求的滚动平均 TPS（用于侧边栏"瞬时"展示，随每次思考变动）。
+   * 仅内存态 tracker 会填充；持久化/报告口径为全量 avgTPS，此字段为 null。
+   */
+  recentTPS: number | null
   avgLatency: number | null
   maxLatency: number | null
   minLatency: number | null
@@ -478,6 +506,11 @@ export interface LogEntry {
   cacheReadTokens: number
   cacheWriteTokens: number
   cost: number
+  /**
+   * 本次请求的 reasoning token 是否以流式 part 产出。
+   * 旧版日志无此字段（undefined），迁移时据此判断需要重算 TPS。
+   */
+  reasoningStreamed?: boolean
 }
 
 // ── HTML report types ──

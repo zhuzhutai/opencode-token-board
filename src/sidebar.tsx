@@ -709,7 +709,7 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
                         <box flexDirection="row">
                           <For each={[
                             { val: formatDuration(perfStats().models[key]?.avgTTFT ?? null), lbl: t("ttft"), rw: 6 },
-                            { val: perfStats().models[key]?.avgTPS?.toFixed(1) ?? "—", lbl: t("tps"), rw: 6 },
+                            { val: (perfStats().models[key]?.recentTPS ?? perfStats().models[key]?.avgTPS)?.toFixed(1) ?? "—", lbl: t("tps"), rw: 6 },
                             { val: formatDuration(perfStats().models[key]?.avgLatency ?? null), lbl: t("latency"), rw: 6 },
                           ]}>
                             {(item, idx) => {

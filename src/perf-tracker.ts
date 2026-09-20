@@ -1,5 +1,6 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { LogEntry, ModelPerfStats, SessionPerfStats } from "./formatter.js"
+import { computeTps } from "./formatter.js"
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -7,6 +8,9 @@ import { existsSync, statSync } from "node:fs"
 import { updatePersistedStats } from "./stats-store.js"
 
 const LOG_PATH = join(homedir(), ".opencode", "tokenwatch.jsonl")
+
+/** 侧边栏"瞬时"TPS 使用的滚动窗口大小（最近 N 次请求） */
+const TPS_ROLLING_WINDOW = 5
 
 interface PartEvent {
   message_id?: string
@@ -42,15 +46,38 @@ interface MessageRemoveEvent {
   }
 }
 
+/**
+ * 解析日志条目的 TPS：
+ * - 新日志（含 reasoningStreamed）直接使用 tracker 计算结果；
+ * - 旧日志（无该字段，例如从 JSONL 载入的历史会话）按新口径重算，
+ *   用 latency - ttft 反推生成窗口并纳入 reasoning token。
+ */
+function resolveTps(entry: LogEntry): number | null {
+  if (entry.reasoningStreamed !== undefined) return entry.tps
+  const genMs = entry.latency_ms != null && entry.ttft_ms != null
+    ? entry.latency_ms - entry.ttft_ms
+    : null
+  return computeTps(entry.outputTokens, entry.reasoningTokens, genMs) ?? entry.tps
+}
+
 class PerfTracker {
   private firstPartTimes = new Map<string, number>()
   private statsMap = new Map<string, ModelPerfStats>()
   /** 原始样本串，用于分位数计算，不持久化 */
   private ttftSamples = new Map<string, number[]>()
   private latencySamples = new Map<string, number[]>()
+  /** 出现过 reasoning part 的消息：只有真正流式生成的推理 token 才计入 TPS */
+  private reasoningMessages = new Set<string>()
+  /** 每个模型最近 N 次请求的 TPS 样本，用于计算滚动"瞬时"TPS */
+  private tpsWindow = new Map<string, number[]>()
 
   handlePartUpdated(event: PartEvent): void {
-    if (!event.time?.start || !event.message_id) return
+    if (!event.message_id) return
+    // 记录该消息是否流式产出过推理内容（决定 reasoning token 能否计入 TPS 分子）
+    if (event.type === "reasoning") {
+      this.reasoningMessages.add(event.message_id)
+    }
+    if (!event.time?.start) return
     // Bug fix: 取最早 part 时间而非最后一个，避免 TTFT 被高估
     const cur = this.firstPartTimes.get(event.message_id) ?? Number.POSITIVE_INFINITY
     if (event.time.start < cur) {
@@ -68,6 +95,7 @@ class PerfTracker {
     const completed = info.time.completed
     if (!created || !completed) {
       this.firstPartTimes.delete(messageID)
+      this.reasoningMessages.delete(messageID)
       return
     }
 
@@ -85,24 +113,30 @@ class PerfTracker {
     const cost = info.cost ?? 0
 
     // 过滤全零 token 的失败请求，不写入日志和统计，防止污染数据
-    if (inputTokens + outputTokens + cacheRead + cacheWrite === 0) {
+    if (inputTokens + outputTokens + reasoningTokens + cacheRead + cacheWrite === 0) {
       this.firstPartTimes.delete(messageID)
+      this.reasoningMessages.delete(messageID)
       return
     }
 
     const firstPart = this.firstPartTimes.get(messageID) ?? null
+    // 仅当推理内容确实以流式 part 产出时才把 reasoning token 计入分子，
+    // 否则（部分 provider 只在最终 usage 中返回 reasoning）会高估生成速度。
+    const reasoningStreamed = this.reasoningMessages.has(messageID)
+    const streamedReasoning = reasoningStreamed ? reasoningTokens : 0
 
     const latencyMs = completed - created
     const ttftMs = firstPart !== null ? firstPart - created : null
     const genMs = firstPart !== null ? completed - firstPart : null
-    const tps = (genMs !== null && genMs > 0 && outputTokens > 0)
-      ? (outputTokens / genMs) * 1000
-      : null
+    // Bug fix: 分子包含 reasoning token（与分母的生成窗口一致），否则会系统性低估。
+    // outputTokens 不含 reasoningTokens：total = input + output + reasoning + cache。
+    const tps = computeTps(outputTokens, streamedReasoning, genMs)
     // Bug fix: 移除 TPS fallback。
     // 原 fallback 用 latencyMs（completed-created，含排队+TTFT）计算 TPS，
     // 会使结果严重低估（约 40%+）。null 表示"无可靠数据"比虚假数字更好。
 
     this.firstPartTimes.delete(messageID)
+    this.reasoningMessages.delete(messageID)
 
     const entry: LogEntry = {
       ts: new Date().toISOString(),
@@ -111,7 +145,7 @@ class PerfTracker {
       modelID,
       sessionID,
       ttft_ms: ttftMs,
-      tps: tps,          // 只在有可靠 genMs 时才有值
+      tps: tps,          // 生成吞吐：(output + 流式 reasoning) / genMs，无可靠 genMs 时为 null
       latency_ms: latencyMs,
       inputTokens,
       outputTokens,
@@ -119,6 +153,7 @@ class PerfTracker {
       cacheReadTokens: cacheRead,
       cacheWriteTokens: cacheWrite,
       cost,
+      reasoningStreamed,
     }
 
     this.appendLog(entry)
@@ -149,6 +184,7 @@ class PerfTracker {
     const mid = event.properties?.messageID ?? ""
     if (mid) {
       this.firstPartTimes.delete(mid)
+      this.reasoningMessages.delete(mid)
     }
   }
 
@@ -176,6 +212,7 @@ class PerfTracker {
         avgTPS: null,
         maxTPS: null,
         minTPS: null,
+        recentTPS: null,
         avgLatency: null,
         maxLatency: null,
         minLatency: null,
@@ -208,14 +245,21 @@ class PerfTracker {
       this.ttftSamples.set(model, ttftArr)
     }
 
-    if (entry.tps !== null) {
+    // 新日志信任 tracker 的 tps；从 JSONL 载入的旧日志按新口径重算（含 reasoning）
+    const tps = resolveTps(entry)
+    if (tps !== null) {
       // Bug fix: 分母使用 tpsCount（有效样本数）
       stats.tpsCount++
       const c = stats.tpsCount
       const prev = stats.avgTPS
-      stats.avgTPS = prev !== null ? prev + (entry.tps - prev) / c : entry.tps
-      stats.maxTPS = stats.maxTPS !== null ? Math.max(stats.maxTPS, entry.tps) : entry.tps
-      stats.minTPS = stats.minTPS !== null ? Math.min(stats.minTPS, entry.tps) : entry.tps
+      stats.avgTPS = prev !== null ? prev + (tps - prev) / c : tps
+      stats.maxTPS = stats.maxTPS !== null ? Math.max(stats.maxTPS, tps) : tps
+      stats.minTPS = stats.minTPS !== null ? Math.min(stats.minTPS, tps) : tps
+      // 维护滚动窗口（有界）：仅保留最近 N 次请求，供侧边栏"瞬时"TPS 使用
+      const win = this.tpsWindow.get(model) ?? []
+      win.push(tps)
+      if (win.length > TPS_ROLLING_WINDOW) win.splice(0, win.length - TPS_ROLLING_WINDOW)
+      this.tpsWindow.set(model, win)
     }
 
     if (entry.latency_ms !== null) {
@@ -268,6 +312,10 @@ class PerfTracker {
       s.p95Latency = this.percentile(latArr, 95)
       s.p99Latency = this.percentile(latArr, 99)
 
+      // 滚动"瞬时"TPS：最近 N 次请求的平均，随每次思考变动
+      const win = this.tpsWindow.get(model) ?? []
+      s.recentTPS = win.length > 0 ? win.reduce((a, b) => a + b, 0) / win.length : s.avgTPS
+
       // 模型级缓存命中率
       const denom = s.totalInput + s.totalCacheRead
       s.cacheHitRate = denom > 0 ? (s.totalCacheRead / denom) * 100 : null
@@ -312,6 +360,8 @@ class PerfTracker {
     this.statsMap.clear()
     this.ttftSamples.clear()
     this.latencySamples.clear()
+    this.reasoningMessages.clear()
+    this.tpsWindow.clear()
   }
 
   loadSession(sessionID: string): void {
@@ -319,6 +369,8 @@ class PerfTracker {
     this.statsMap.clear()
     this.ttftSamples.clear()
     this.latencySamples.clear()
+    this.reasoningMessages.clear()
+    this.tpsWindow.clear()
 
     if (!sessionID) return
 

@@ -12,11 +12,13 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import type { LogEntry, ModelPerfStats } from "./formatter.js"
+import { computeTps } from "./formatter.js"
 
 const STATS_PATH = join(homedir(), ".opencode", "tokenwatch-stats.json")
 const LOG_PATH = join(homedir(), ".opencode", "tokenwatch.jsonl")
 const RESERVOIR_SIZE = 500   // 每个指标最多保留的原始样本数
-const CURRENT_VERSION = 1
+// v2: TPS 分子纳入 reasoning token（旧版仅用 output，系统性低估生成速度）
+const CURRENT_VERSION = 2
 
 /** 持久化存储的单模型统计（含原始样本用于分位数计算） */
 interface PersistedModelStats {
@@ -107,6 +109,21 @@ function reservoirAdd(reservoir: number[], value: number, totalCount: number): n
 // 核心增量更新逻辑（可复用于单条 & 批量迁移）
 // ─────────────────────────────────────────────
 
+/**
+ * 从日志条目还原"修正后"的 TPS。
+ *
+ * 迁移历史日志时，旧条目的 `tps` 字段是用 output/genMs 算出的（漏掉了 reasoning），
+ * 不能直接信任。这里用同一条目的 latency_ms 与 ttft_ms 反推生成窗口
+ * （latency - ttft == completed - firstPart == genMs），再按新口径重算，
+ * 从而让全量历史统计与新版一致。
+ */
+function effectiveTps(entry: LogEntry): number | null {
+  const genMs = entry.latency_ms != null && entry.ttft_ms != null
+    ? entry.latency_ms - entry.ttft_ms
+    : null
+  return computeTps(entry.outputTokens, entry.reasoningTokens, genMs) ?? entry.tps
+}
+
 function applyEntryToModels(models: Record<string, PersistedModelStats>, entry: LogEntry): void {
   const key = entry.model
   let s = models[key]
@@ -148,12 +165,15 @@ function applyEntryToModels(models: Record<string, PersistedModelStats>, entry: 
     s.ttftReservoir = reservoirAdd(s.ttftReservoir, entry.ttft_ms, s.ttftCount)
   }
 
-  if (entry.tps != null) {
+  // 新日志（带 reasoningStreamed 标记）直接信任 tracker 写入的 tps；
+  // 旧日志（无该字段）用修正口径重算，保证迁移后历史数据不低估。
+  const tps = entry.reasoningStreamed === undefined ? effectiveTps(entry) : entry.tps
+  if (tps != null) {
     s.tpsCount++
     const c = s.tpsCount
-    s.avgTPS = s.avgTPS != null ? s.avgTPS + (entry.tps - s.avgTPS) / c : entry.tps
-    s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, entry.tps) : entry.tps
-    s.minTPS = s.minTPS != null ? Math.min(s.minTPS, entry.tps) : entry.tps
+    s.avgTPS = s.avgTPS != null ? s.avgTPS + (tps - s.avgTPS) / c : tps
+    s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, tps) : tps
+    s.minTPS = s.minTPS != null ? Math.min(s.minTPS, tps) : tps
   }
 
   if (entry.latency_ms != null) {
@@ -288,6 +308,7 @@ export function readPersistedStats(): ModelPerfStats[] {
         avgTPS: s.avgTPS,
         maxTPS: s.maxTPS,
         minTPS: s.minTPS,
+        recentTPS: null,
         avgLatency: s.avgLatency,
         maxLatency: s.maxLatency,
         minLatency: s.minLatency,
