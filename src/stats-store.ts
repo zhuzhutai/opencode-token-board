@@ -12,11 +12,13 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import type { LogEntry, ModelPerfStats } from "./formatter.js"
+import { computeTps } from "./formatter.js"
 
 const STATS_PATH = join(homedir(), ".opencode", "tokenwatch-stats.json")
 const LOG_PATH = join(homedir(), ".opencode", "tokenwatch.jsonl")
 const RESERVOIR_SIZE = 500   // 每个指标最多保留的原始样本数
-const CURRENT_VERSION = 1
+// v2: TPS 分子纳入 reasoning token（旧版仅用 output，系统性低估生成速度）
+const CURRENT_VERSION = 2
 
 /** 持久化存储的单模型统计（含原始样本用于分位数计算） */
 interface PersistedModelStats {
@@ -58,23 +60,56 @@ interface StatsFile {
 // 内部 I/O 工具
 // ─────────────────────────────────────────────
 
+// 进程内缓存 + 防抖落盘：
+// 旧实现每次请求都「读整个统计文件 → 改 → 写回」，文件越大每次响应越慢。
+// 现在统计文件只在进程内维护一份，写入合并为最多每 800ms 一次。
+let cachedFile: StatsFile | null = null
+let dirty = false
+let flushTimer: ReturnType<typeof setTimeout> | null = null
+
 function loadStatsFile(): StatsFile {
+  if (cachedFile) return cachedFile
   try {
-    if (!existsSync(STATS_PATH)) {
-      return { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
+    if (existsSync(STATS_PATH)) {
+      const content = readFileSync(STATS_PATH, "utf-8")
+      const parsed = JSON.parse(content) as StatsFile
+      if (parsed?.version === CURRENT_VERSION && parsed.models) {
+        cachedFile = parsed
+        return cachedFile
+      }
     }
-    const content = readFileSync(STATS_PATH, "utf-8")
-    const parsed = JSON.parse(content) as StatsFile
-    if (parsed?.version === CURRENT_VERSION && parsed.models) return parsed
   } catch { /* 文件损坏时返回空白统计 */ }
-  return { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
+  cachedFile = { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
+  return cachedFile
 }
 
-function saveStatsFile(file: StatsFile): void {
+/** 立即落盘（仅在 dirty 时）。 */
+function flushStatsFile(): void {
+  if (!cachedFile || !dirty) return
+  dirty = false
   try {
-    file.updatedAt = new Date().toISOString()
-    writeFileSync(STATS_PATH, JSON.stringify(file), "utf-8")
+    cachedFile.updatedAt = new Date().toISOString()
+    writeFileSync(STATS_PATH, JSON.stringify(cachedFile), "utf-8")
   } catch { /* 写入失败不影响主流程 */ }
+}
+
+/** 标记脏并安排一次防抖落盘。 */
+function scheduleFlush(): void {
+  dirty = true
+  if (flushTimer) return
+  flushTimer = setTimeout(() => {
+    flushTimer = null
+    flushStatsFile()
+  }, 800)
+  ;(flushTimer as any).unref?.()
+}
+
+/** 仅供测试/诊断：丢弃进程内缓存（下次读取重新从磁盘加载）。 */
+export function resetStatsCache(): void {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null }
+  flushStatsFile()
+  cachedFile = null
+  dirty = false
 }
 
 // ─────────────────────────────────────────────
@@ -106,6 +141,21 @@ function reservoirAdd(reservoir: number[], value: number, totalCount: number): n
 // ─────────────────────────────────────────────
 // 核心增量更新逻辑（可复用于单条 & 批量迁移）
 // ─────────────────────────────────────────────
+
+/**
+ * 从日志条目还原"修正后"的 TPS。
+ *
+ * 迁移历史日志时，旧条目的 `tps` 字段是用 output/genMs 算出的（漏掉了 reasoning），
+ * 不能直接信任。这里用同一条目的 latency_ms 与 ttft_ms 反推生成窗口
+ * （latency - ttft == completed - firstPart == genMs），再按新口径重算，
+ * 从而让全量历史统计与新版一致。
+ */
+function effectiveTps(entry: LogEntry): number | null {
+  const genMs = entry.latency_ms != null && entry.ttft_ms != null
+    ? entry.latency_ms - entry.ttft_ms
+    : null
+  return computeTps(entry.outputTokens, entry.reasoningTokens, genMs) ?? entry.tps
+}
 
 function applyEntryToModels(models: Record<string, PersistedModelStats>, entry: LogEntry): void {
   const key = entry.model
@@ -148,12 +198,15 @@ function applyEntryToModels(models: Record<string, PersistedModelStats>, entry: 
     s.ttftReservoir = reservoirAdd(s.ttftReservoir, entry.ttft_ms, s.ttftCount)
   }
 
-  if (entry.tps != null) {
+  // 新日志（带 reasoningStreamed 标记）直接信任 tracker 写入的 tps；
+  // 旧日志（无该字段）用修正口径重算，保证迁移后历史数据不低估。
+  const tps = entry.reasoningStreamed === undefined ? effectiveTps(entry) : entry.tps
+  if (tps != null) {
     s.tpsCount++
     const c = s.tpsCount
-    s.avgTPS = s.avgTPS != null ? s.avgTPS + (entry.tps - s.avgTPS) / c : entry.tps
-    s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, entry.tps) : entry.tps
-    s.minTPS = s.minTPS != null ? Math.min(s.minTPS, entry.tps) : entry.tps
+    s.avgTPS = s.avgTPS != null ? s.avgTPS + (tps - s.avgTPS) / c : tps
+    s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, tps) : tps
+    s.minTPS = s.minTPS != null ? Math.min(s.minTPS, tps) : tps
   }
 
   if (entry.latency_ms != null) {
@@ -239,11 +292,8 @@ export function updatePersistedStats(entry: LogEntry): void {
   try {
     const file = loadStatsFile()
     applyEntryToModels(file.models, entry)
-    // 如果尚未完成迁移，先标记（避免 readPersistedStats 再重复迁移后与当前增量数据合并）
-    // 实际上：首次有请求时 migratedFromLogs 必然为 false，
-    // 所以 readPersistedStats 首次被调用时会重建全量历史，覆盖这个增量写入。
-    // 这是可接受的：迁移完成后统计文件是完整的（含本条目，因为 JSONL 已先写入）。
-    saveStatsFile(file)
+    // 只改内存 + 标记脏，实际写盘由防抖合并（避免每次请求都同步读写整个文件）
+    scheduleFlush()
   } catch { /* 统计写入失败不影响主流程 */ }
 }
 
@@ -260,7 +310,8 @@ export function readPersistedStats(): ModelPerfStats[] {
     if (!file.migratedFromLogs) {
       file.models = {}  // 清空，让迁移从零开始重建
       migrateFromLogsIfNeeded(file)
-      saveStatsFile(file)
+      dirty = true
+      flushStatsFile()
     }
 
     return Object.values(file.models).map(s => {
@@ -288,6 +339,7 @@ export function readPersistedStats(): ModelPerfStats[] {
         avgTPS: s.avgTPS,
         maxTPS: s.maxTPS,
         minTPS: s.minTPS,
+        recentTPS: null,
         avgLatency: s.avgLatency,
         maxLatency: s.maxLatency,
         minLatency: s.minLatency,
