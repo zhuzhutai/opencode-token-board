@@ -1,4 +1,5 @@
 import type { LogEntry, ModelPerfStats, SessionPerfStats } from "./formatter.js"
+import { computeTps } from "./formatter.js"
 import type { TokenMessage } from "./types.js"
 import { hasPerfTiming } from "./types.js"
 import { appendFileSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs"
@@ -33,7 +34,7 @@ function emptyStats(model: string, providerID: string): ModelPerfStats {
     totalCacheWrite: 0,
     totalCost: 0,
     avgTTFT: null, maxTTFT: null, minTTFT: null, p50TTFT: null, p95TTFT: null, p99TTFT: null,
-    avgTPS: null, maxTPS: null, minTPS: null,
+    avgTPS: null, maxTPS: null, minTPS: null, recentTPS: null,
     avgLatency: null, maxLatency: null, minLatency: null, p50Latency: null, p95Latency: null, p99Latency: null,
     cacheHitRate: null,
   }
@@ -52,10 +53,10 @@ export function derivePerf(m: TokenMessage): PerfSample {
   const completed = m.completed!
   const latency = completed - created
   const ttft = typeof m.streamed === "number" && m.streamed > 0 ? m.streamed - created : null
-  // TPS = 输出token / 生成耗时（completed - streamed）。无可靠 streamed 则为 null（宁缺毋滥，避免低估）。
-  const tps = (ttft !== null && completed > m.streamed! && m.outputTokens > 0)
-    ? (m.outputTokens / (completed - m.streamed!)) * 1000
-    : null
+  // TPS：计入 reasoning token（推理与可见输出同处一个流式窗口，只算 output 会低估）。
+  // 无可靠 streamed 则 genMs 为 null → tps null（宁缺毋滥）。
+  const genMs = ttft !== null && completed > m.streamed! ? completed - m.streamed! : null
+  const tps = computeTps(m.outputTokens, m.reasoningTokens, genMs)
   return { ttft, latency, tps }
 }
 
