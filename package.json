@@ -1,7 +1,7 @@
 {
   "name": "opencode-token-board",
-  "version": "0.2.0",
-  "description": "Real-time token usage, cache analytics & performance dashboard plugin for OpenCode CLI",
+  "version": "1.0.0",
+  "description": "Real-time token usage, cache analytics & performance dashboard plugin for OpenCode V2",
   "type": "module",
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
@@ -12,10 +12,7 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "import": "./dist/tui.js",
-      "config": {
-        "enabled": true
-      }
+      "import": "./dist/tui.js"
     },
     "./server": {
       "types": "./dist/server.d.ts",
@@ -32,18 +29,17 @@
   },
   "scripts": {
     "build": "tsc && node build.tui.mjs",
-    "test:popup": "node ./scripts/test-popup.mjs",
+    "typecheck": "tsc --noEmit",
     "release:check": "node ./scripts/publish-check.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
     "opencode",
+    "opencode-v2",
     "plugin",
-    "opencode-plugin",
     "tokens",
     "usage",
     "stats",
-    "sqlite",
     "analytics",
     "tui"
   ],
@@ -57,14 +53,23 @@
     "url": "https://github.com/zhuzhutai/opencode-token-board/issues"
   },
   "homepage": "https://github.com/zhuzhutai/opencode-token-board#readme",
+  "dependencies": {
+    "@opencode/plugin": "2.0.29"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
+    "solid-js": ">=1.9.0"
+  },
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opentui/core": "^0.2.9",
-    "@opentui/keymap": "^0.2.9",
-    "@opentui/solid": "^0.2.9",
+    "@opencode/client": "2.0.29",
+    "@opencode/theme": "^2.0.29",
+    "@opentui/core": "0.6.6",
+    "@opentui/solid": "0.6.6",
     "@types/node": "^22.0.0",
     "esbuild": "^0.25.0",
     "esbuild-plugin-solid": "^0.5.0",
+    "solid-js": "1.9.12",
     "typescript": "^5.7.0"
   },
   "publishConfig": {

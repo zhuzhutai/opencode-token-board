@@ -1,323 +1,147 @@
 /** @jsxImportSource @opentui/solid */
-import { createSignal, createEffect, onCleanup } from "solid-js"
-import type { TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { homedir } from "node:os"
+import { Plugin } from "@opencode/plugin/tui"
+import type { Context } from "@opencode/plugin/tui/context"
+import { createSignal } from "solid-js"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { readFileSync, readdirSync, unlinkSync } from "node:fs"
+import { homedir } from "node:os"
 import { registerCommands } from "./commands.js"
-import { createPerfTracker } from "./perf-tracker.js"
+import { PerfRecorder } from "./perf-tracker.js"
+import { extractTokenMessages } from "./mapper.js"
 import { createGoUsageFetcher } from "./go-usage.js"
 import type { GoUsageFetcher } from "./go-usage.js"
-import { notifyWindows, notifyPermissionWindows } from "./notify.js"
+import { createBoardStorage } from "./storage.js"
+import type { BoardStorage } from "./storage.js"
+import { setLanguage, t } from "./i18n.js"
 import { TokenWatchPanel } from "./sidebar.js"
-import { t } from "./i18n.js"
 
-export interface TokenMessage {
-  id: string
-  sessionID: string
-  providerID: string
-  modelID: string
-  inputTokens: number
-  outputTokens: number
-  reasoningTokens: number
-  cacheRead: number
-  cacheWrite: number
-  cost: number
-}
+/**
+ * ══════════════════════════════════════════════════════════════════
+ *  tui.tsx — OpenCode V2 CLI 插件入口
+ *
+ *  职责：装配数据流（事件 → 消息同步 → 性能记录 → 侧边栏刷新）、注册槽位与命令、
+ *  处理会话完成通知。具体渲染在 sidebar.tsx，菜单在 commands.tsx。
+ *
+ *  ── v1 → v2 关键变化 ───────────────────────────────────────────
+ *  · 入口：`{ id, tui(api) }` → `Plugin.define({ id, setup(ctx) })`，清理函数由 setup 返回
+ *  · 事件：`api.event.on(type, cb)` + `event.properties` → `ctx.data.on(type, cb)` + `event.data`
+ *  · 数据源：v1 逐 `message.updated` 抠 token → v2 以 `ctx.data.session.message.list()`
+ *    为**唯一事实源**，事件仅作「触发同步 + 重算」信号（更稳、自愈，会话切换免轮询）
+ *  · 性能指标：从消息自身 `time.{created,streamed,completed}` 直接算，无需跨事件追踪首 part
+ *  · 持久化：`api.kv`（同步、非响应、需轮询版本号）→ `ctx.storage.store`（同步读 + 响应式）
+ *  · 通知：自建 Windows 弹窗 → `ctx.attention.notify`（原生系统通知 + 音效）
+ *  · 权限弹窗：**整条链路删除**（退回 v2 TUI 原生权限提示），见需求边界
+ *  ──────────────────────────────────────────────────────────────────
+ */
 
-function kvKey(sessionID: string): string {
-  return "tokenwatch-msgs-" + sessionID
-}
+/** 事件触发的同步/记录去抖间隔（毫秒）。合并同一帧内的密集事件。 */
+const SYNC_DEBOUNCE_MS = 60
 
-const approvalDirectory = join(homedir(), ".opencode", "tokenwatch-approvals")
-
-const tui: TuiPluginModule["tui"] = async (api) => {
-  const perfTracker = createPerfTracker()
-  const goUsageFetcher: GoUsageFetcher = createGoUsageFetcher()
-  const [sidebarRevision, setSidebarRevision] = createSignal(0)
-  const [allTokenMessages, setAllTokenMessages] = createSignal<TokenMessage[]>([])
-  let currentSlotSessionID = ""
-  const cleanups: (() => void)[] = []
-
-  registerCommands(api)
-
-  function loadGoConfig(): void {
-    try {
-      const cfg = api.kv?.get?.("tokenwatch-config") as { go?: { workspaceID?: string; cookie?: string } } | undefined
-      if (cfg?.go?.workspaceID && cfg?.go?.cookie) {
-        goUsageFetcher.setConfig(cfg.go.workspaceID, cfg.go.cookie)
-        return
-      }
-    } catch { /* 忽略，尝试 fallback */ }
-    // 复用 opencode-go-usage 插件的配置，避免重复填 Cookie
-    try {
-      const cfgFile = join(homedir(), ".config", "opencode", "opencode-go-usage.json")
-      const raw = JSON.parse(readFileSync(cfgFile, "utf-8")) as { workspaceId?: string; authCookie?: string }
-      if (raw?.workspaceId && raw?.authCookie) {
-        goUsageFetcher.setConfig(raw.workspaceId, raw.authCookie)
-      }
-    } catch { /* 无配置文件则不启用 */ }
+function loadGoConfig(storage: BoardStorage, fetcher: GoUsageFetcher): void {
+  // 优先插件配置（storage），其次复用 opencode-go-usage 插件的配置文件，避免重复填 Cookie
+  const go = storage.config.go
+  if (go?.workspaceID && go?.cookie) {
+    fetcher.setConfig(go.workspaceID, go.cookie)
+    return
   }
-  loadGoConfig()
-
-  function persistToKv(sessionID: string, msgs: TokenMessage[]): void {
-    try {
-      api.kv?.set?.(kvKey(sessionID), msgs)
-    } catch { /* non-critical */ }
-  }
-
-  const unsubMsgUpdated = api.event.on("message.updated", (event: any) => {
-    const info = event.properties?.info
-
-    perfTracker.handleMessageUpdated(event)
-
-    // 一轮会话结束（assistant 消息完成且有有效 token）→ 刷新 Go 用量
-    if (info?.role === "assistant" && (info?.tokens?.total ?? 0) > 0 && info?.time?.completed) {
-      goUsageFetcher.refresh()
-    }
-
-    if (info?.role === "assistant" && info?.tokens?.total > 0) {
-      setAllTokenMessages(prev => {
-        const msg: TokenMessage = {
-          id: info.id,
-          sessionID: info.sessionID ?? "",
-          providerID: info.providerID ?? "unknown",
-          modelID: info.modelID ?? "unknown",
-          inputTokens: info.tokens?.input ?? 0,
-          outputTokens: info.tokens?.output ?? 0,
-          reasoningTokens: info.tokens?.reasoning ?? 0,
-          cacheRead: info.tokens?.cache?.read ?? 0,
-          cacheWrite: info.tokens?.cache?.write ?? 0,
-          cost: info.cost ?? 0,
-        }
-        const idx = prev.findIndex(m => m.id === msg.id)
-        let next: TokenMessage[]
-        if (idx >= 0) {
-          next = [...prev]
-          next[idx] = msg
-        } else {
-          next = [...prev, msg]
-        }
-        // Bug fix: 优先使用事件自带的 sessionID，而非 currentSlotSessionID
-        // currentSlotSessionID 在 slot 首次渲染时才更新，session 切换瞬间可能落后
-        const targetSessionID = info.sessionID ?? currentSlotSessionID
-        persistToKv(targetSessionID, next)
-        return next
-      })
-    }
-
-
-    setSidebarRevision((v) => v + 1)
-  })
-  cleanups.push(unsubMsgUpdated)
-
-  const unsubPartUpdated = api.event.on("message.part.updated", (event: any) => {
-    perfTracker.handlePartUpdated({
-      message_id: event.properties?.part?.messageID,
-      type: event.properties?.part?.type,
-      text: event.properties?.part?.type === "text" ? event.properties?.part?.text : undefined,
-      time: { start: event.properties?.part?.time?.start },
-    })
-  })
-  cleanups.push(unsubPartUpdated)
-
-  const unsubRemoved = api.event.on("message.removed", () => {
-    setSidebarRevision((v) => v + 1)
-  })
-  cleanups.push(unsubRemoved)
-
-  // 会话整段空闲 → 刷新 Go 用量 + Windows 右下角提示
-  const unsubSessionIdle = api.event.on("session.idle", () => {
-    goUsageFetcher.refresh(true)
-    notifyWindows(t("notifySessionIdleTitle"), t("notifySessionIdleBody"))
-  })
-  cleanups.push(unsubSessionIdle)
-
-  // 已弹 Toast 的待审批权限请求；标记文件命中后调用 permission.reply 放行
-  const pendingRequests = new Map<string, { sessionID: string; permission: string; pattern: string }>()
-  const repliedIds = new Set<string>()
-
-  // 申请权限 → Windows 右下角三按钮 Toast（允许一次 / 总是允许 / 拒绝）
-  const unsubPermissionAsked = api.event.on("permission.asked", (event: any) => {
-    const props = event.properties as { id?: string; sessionID?: string; permission?: string; patterns?: string[] } | undefined
-    if (!props?.id) return
-    const permission = props.permission ?? ""
-    const pattern = (props.patterns ?? []).join(" ")
-    pendingRequests.set(props.id, { sessionID: props.sessionID ?? "", permission, pattern })
-    notifyPermissionWindows({
-      requestID: props.id,
-      title: t("notifyPermissionTitle"),
-      message: pattern ? `${permission}: ${pattern}` : permission,
-      allowOnceLabel: t("permAllowOnce"),
-      alwaysLabel: t("permAlways"),
-      rejectLabel: t("permReject"),
-      pid: process.pid,
-    })
-  })
-  cleanups.push(unsubPermissionAsked)
-
-  // 权限在终端内已被回复 → 从待审批表移除
-  const unsubPermissionReplied = api.event.on("permission.replied", (event: any) => {
-    const props = event.properties as { requestID?: string } | undefined
-    if (props?.requestID) pendingRequests.delete(props.requestID)
-  })
-  cleanups.push(unsubPermissionReplied)
-
-  // 轮询批准标记目录：用户点击 Toast 按钮后由 approve-handler.ps1 写入 <requestID>.<reply>
-  const pollTimer = setInterval(() => {
-    if (pendingRequests.size === 0) return
-    let entries: string[] = []
-    try {
-      entries = readdirSync(approvalDirectory)
-    } catch { return }
-    for (const entry of entries) {
-      const dotIdx = entry.lastIndexOf(".")
-      if (dotIdx <= 0) continue
-      const requestID = entry.slice(0, dotIdx)
-      const reply = entry.slice(dotIdx + 1)
-      if (reply !== "once" && reply !== "always" && reply !== "reject") continue
-      const pending = pendingRequests.get(requestID)
-      if (!pending || repliedIds.has(requestID)) continue
-
-      repliedIds.add(requestID)
-      pendingRequests.delete(requestID)
-      try { unlinkSync(join(approvalDirectory, entry)) } catch { }
-
-      api.client.permission
-        .reply({ requestID, reply })
-        .then((res: any) => {
-          const failed = res?.error != null
-          if (failed) {
-            api.ui.toast?.({ message: t("permReplyFailed"), variant: "error" })
-          } else {
-            api.ui.toast?.({
-              message: reply === "reject" ? t("permRejected") : t("permAllowed"),
-              variant: reply === "reject" ? "warning" : "success",
-            })
-          }
-        })
-        .catch(() => {
-          api.ui.toast?.({ message: t("permReplyFailed"), variant: "error" })
-        })
-    }
-  }, 300)
-  cleanups.push(() => clearInterval(pollTimer))
-
-  api.lifecycle?.onDispose?.(() => {
-    for (const cleanup of cleanups) cleanup()
-  })
-
-  api.slots.register({
-    order: 50,
-    slots: {
-      sidebar_content: (_ctx, { session_id }) => {
-        sidebarRevision()
-
-        if (session_id && session_id !== currentSlotSessionID) {
-          currentSlotSessionID = session_id
-          perfTracker.loadSession(session_id)
-
-          let loaded: TokenMessage[] = []
-          try {
-            const saved = api.kv?.get?.(kvKey(session_id)) as TokenMessage[] | undefined
-            if (saved && saved.length > 0) loaded = saved
-          } catch {}
-          setAllTokenMessages(loaded)
-        }
-
-        // 引入 createEffect 监听历史会话消息在后台异步加载完毕后的变化
-        // 由于历史会话加载可能是异步的，初次检查 messages 可能为空且底层并非响应式数据源，
-        // 故采用短期高频轮询，直到数据加载完成或超时。
-        createEffect(() => {
-          if (!session_id) return
-
-          let timer: any = null
-          let pollCount = 0
-          const maxPolls = 50 // 最多轮询 10 秒 (50 * 200ms)
-
-          const checkAndPopulate = () => {
-            const existing = api.state.session.messages(session_id)
-            if (!existing || existing.length === 0) return false
-
-            setAllTokenMessages((prev) => {
-              let changed = false
-              const next = [...prev]
-              for (const msg of existing) {
-                if ((msg as any).role !== "assistant") continue
-                const tokens = (msg as any).tokens
-                // 与 message.updated 处理器保持一致：过滤 total=0 的失败请求
-                if (!tokens || (tokens.total ?? 0) === 0) continue
-
-                const id = (msg as any).id
-                const idx = next.findIndex(m => m.id === id)
-                const tokenMsg: TokenMessage = {
-                  id,
-                  sessionID: session_id,
-                  providerID: (msg as any).providerID ?? "unknown",
-                  modelID: (msg as any).modelID ?? "unknown",
-                  inputTokens: tokens?.input ?? 0,
-                  outputTokens: tokens?.output ?? 0,
-                  reasoningTokens: tokens?.reasoning ?? 0,
-                  cacheRead: tokens?.cache?.read ?? 0,
-                  cacheWrite: tokens?.cache?.write ?? 0,
-                  cost: (msg as any).cost ?? 0,
-                }
-
-                if (idx >= 0) {
-                  const cur = next[idx]
-                  if (
-                    cur.inputTokens !== tokenMsg.inputTokens ||
-                    cur.outputTokens !== tokenMsg.outputTokens ||
-                    cur.reasoningTokens !== tokenMsg.reasoningTokens ||
-                    cur.cacheRead !== tokenMsg.cacheRead ||
-                    cur.cacheWrite !== tokenMsg.cacheWrite ||
-                    cur.cost !== tokenMsg.cost
-                  ) {
-                    next[idx] = tokenMsg
-                    changed = true
-                  }
-                } else {
-                  next.push(tokenMsg)
-                  changed = true
-                }
-              }
-
-              if (changed) {
-                persistToKv(session_id, next)
-                return next
-              }
-              return prev
-            })
-            return true
-          }
-
-          const hasMessages = checkAndPopulate()
-          if (!hasMessages) {
-            timer = setInterval(() => {
-              pollCount++
-              if (checkAndPopulate() || pollCount >= maxPolls) {
-                clearInterval(timer)
-                timer = null
-              }
-            }, 200)
-          }
-
-          onCleanup(() => {
-            if (timer) {
-              clearInterval(timer)
-            }
-          })
-        })
-
-        return <TokenWatchPanel api={api} theme={api.theme} perfTracker={perfTracker} messages={() => api.state.session.messages(session_id)} allTokenMessages={allTokenMessages} goUsageFetcher={goUsageFetcher} />
-      },
-    },
-  })
+  try {
+    const cfgFile = join(homedir(), ".config", "opencode", "opencode-go-usage.json")
+    const raw = JSON.parse(readFileSync(cfgFile, "utf-8")) as { workspaceId?: string; authCookie?: string }
+    if (raw?.workspaceId && raw?.authCookie) fetcher.setConfig(raw.workspaceId, raw.authCookie)
+  } catch { /* 无配置则不启用 Go 显示 */ }
 }
 
-const plugin: TuiPluginModule & { id: string } = {
+export default Plugin.define({
   id: "opencode-token-board",
-  tui,
-}
+  async setup(context) {
+    const perfRecorder = new PerfRecorder()
+    const goUsageFetcher = createGoUsageFetcher()
+    const storage = createBoardStorage(context)
+    const cleanups: (() => void)[] = []
 
-export default plugin
+    // 同步语言（侧边栏首帧即用正确语言）
+    setLanguage(storage.config.language)
+    loadGoConfig(storage, goUsageFetcher)
+
+    // 「当前侧边栏显示的会话」（普通变量：事件处理器仅用于判断是否刷新侧边栏，无需响应式）
+    let currentSessionID = ""
+    // 版本信号：每次同步完成后 +1，驱动侧边栏 memo 重读消息列表
+    const [version, setVersion] = createSignal(0)
+    const bump = () => setVersion((v) => v + 1)
+
+    // ── 同步 + 记录（去抖）：把指定会话的消息拉到本地缓存，落盘性能样本，必要时刷新侧边栏 ──
+    const dirty = new Set<string>()
+    let syncTimer: ReturnType<typeof setTimeout> | null = null
+    function scheduleRecord(sessionID: string): void {
+      if (!sessionID) return
+      dirty.add(sessionID)
+      if (syncTimer) return
+      syncTimer = setTimeout(async () => {
+        syncTimer = null
+        const ids = [...dirty]
+        dirty.clear()
+        for (const sid of ids) {
+          try { await context.data.session.message.sync(sid) } catch { /* 同步失败忽略 */ }
+          try {
+            const msgs = context.data.session.message.list(sid) ?? []
+            perfRecorder.record(extractTokenMessages(msgs, sid))
+          } catch { /* 记录失败忽略 */ }
+          if (sid === currentSessionID) bump()
+        }
+      }, SYNC_DEBOUNCE_MS)
+    }
+
+    // ── 事件订阅（payload 在 event.data.*）──
+    // 每个 assistant step 完成 → 同步该会话 + 记录（跨会话历史性能也由此捕获）
+    cleanups.push(context.data.on("session.step.ended", (e) => scheduleRecord(e.data.sessionID)))
+    // 流式增量 / 用量更新 / 执行成功 → 若是当前会话则刷新侧边栏（token 分布等实时更新）
+    cleanups.push(context.data.on("session.step.streamed", (e) => { if (e.data.sessionID === currentSessionID) bump() }))
+    cleanups.push(context.data.on("session.usage.updated", (e) => { if (e.data.sessionID === currentSessionID) bump() }))
+    cleanups.push(context.data.on("session.execution.succeeded", (e) => {
+      if (e.data.sessionID === currentSessionID) bump()
+      goUsageFetcher.refresh()
+    }))
+    // 会话空闲 → 刷新 Go 用量 + 原生通知 + 音效
+    cleanups.push(context.data.on("session.idle", async (e) => {
+      if (e.data.sessionID === currentSessionID) bump()
+      goUsageFetcher.refresh(true)
+      try {
+        await context.attention.notify({
+          title: t("notifySessionIdleTitle"),
+          message: t("notifySessionIdleBody"),
+          notification: true,
+          sound: { name: "done" },
+        })
+      } catch { /* 通知失败忽略 */ }
+    }))
+
+    // ── 命令（/usage 菜单）──
+    cleanups.push(registerCommands(context, storage))
+
+    // ── 侧边栏槽位 ──
+    cleanups.push(context.ui.slot({
+      append: "sidebar.content",
+      render: ({ sessionID }) => {
+        if (sessionID !== currentSessionID) {
+          currentSessionID = sessionID
+          scheduleRecord(sessionID) // 首次/切换时同步历史消息
+        }
+        return (
+          <TokenWatchPanel
+            context={context}
+            storage={storage}
+            sessionID={sessionID}
+            version={version}
+            goUsageFetcher={goUsageFetcher}
+          />
+        )
+      },
+    }))
+
+    // ── 清理 ──
+    return () => {
+      for (const c of cleanups) { try { c() } catch { /* 忽略 */ } }
+      if (syncTimer) { clearTimeout(syncTimer); syncTimer = null }
+    }
+  },
+})

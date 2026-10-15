@@ -89,13 +89,6 @@ const zh: Record<string, string> = {
 
   notifySessionIdleTitle: "OpenCode 会话完成",
   notifySessionIdleBody: "本轮会话已结束",
-  notifyPermissionTitle: "OpenCode 请求权限",
-  permAllowOnce: "允许一次",
-  permAlways: "总是允许",
-  permReject: "拒绝",
-  permAllowed: "已放行",
-  permRejected: "已拒绝",
-  permReplyFailed: "放行失败",
 }
 
 const en: Record<string, string> = {
@@ -185,13 +178,6 @@ const en: Record<string, string> = {
 
   notifySessionIdleTitle: "OpenCode session complete",
   notifySessionIdleBody: "This round of session has ended",
-  notifyPermissionTitle: "OpenCode requests permission",
-  permAllowOnce: "Allow once",
-  permAlways: "Always allow",
-  permReject: "Reject",
-  permAllowed: "Approved",
-  permRejected: "Rejected",
-  permReplyFailed: "Reply failed",
 }
 
 let currentLang: SupportedLanguage = detectLanguage()

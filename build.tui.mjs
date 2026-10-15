@@ -15,16 +15,17 @@ import { solidPlugin } from "esbuild-plugin-solid"
 const external = [
   "solid-js",
   "solid-js/*",
+  "solid-js/store",
   "@opentui/solid",
   "@opentui/solid/*",
   "@opentui/core",
   "@opentui/core/*",
-  "@opentui/keymap",
-  "@opentui/keymap/*",
-  "@opencode-ai/plugin",
-  "@opencode-ai/plugin/*",
-  "@opencode-ai/sdk",
-  "@opencode-ai/sdk/*",
+  "@opencode/plugin",
+  "@opencode/plugin/*",
+  "@opencode/client",
+  "@opencode/client/*",
+  "@opencode/theme",
+  "@opencode/theme/*",
 ]
 
 const common = {
