@@ -31,7 +31,6 @@ export interface SidebarConfig {
     showGoUsage: boolean
   }
   language: "zh" | "en" | "auto"
-  go?: { workspaceID?: string; cookie?: string }
 }
 
 export const DEFAULT_SIDEBAR_CONFIG: SidebarConfig = {

@@ -10,7 +10,7 @@ A live sidebar dashboard for the OpenCode V2 TUI that lets you **see** your toke
 - ⚡ **缓存命中率** — 上下文缓存命中可视化，帮你判断 prompt 复用效果 / Visual cache-hit rate to gauge prompt reuse
 - 🚀 **性能指标** — TTFT / TPS / 延迟 + P50/P95/P99 分位数，追踪模型响应速度 / TTFT, TPS, latency with percentiles
 - 📈 **报告导出** — HTML / JSON / Markdown / CSV 一键生成，数据落盘 `~/.opencode/reports/` / One-click HTML/JSON/Markdown/CSV reports
-- 💰 **Go 余额查询** — 查询 OpenCode Go 套餐余量 / Check your OpenCode Go plan balance
+- 💰 **Go 余额查询** — 自动读取已登录凭证，展示 Go 套餐滚动/本周/月用量，零配置 / Auto Go plan usage (zero-config, reads your signed-in credential)
 - 🔔 **原生完成通知** — 会话结束用 OpenCode V2 内置 attention 发系统通知 + 音效 / Native completion notification via OpenCode V2 attention
 
 本项目基于 [opencode-token-watch](https://github.com/Howardzhangdqs/opencode-token-watch) 修改而来，特此鸣谢原项目作者。
@@ -59,18 +59,18 @@ npm install -g opencode-token-board
 - **HTML 报告** — 选择日期范围，生成仪表盘并在浏览器打开
 - **JSON 导出** — 导出完整用量数据至 `~/.opencode/reports/`
 - **文本报告** — 导出 Markdown 格式至 `~/.opencode/reports/`
-- **设置** — 开关侧边栏显示项、切换语言、配置 Go
+- **设置** — 开关侧边栏显示项、切换语言
 
 配置自动持久化到插件存储（跨 TUI 实例同步），无需手动编辑配置文件。
 
-## 配置 OpenCode Go 套餐余量查询
+## Go 套餐用量（零配置）
 
-1. 输入 `/usage` → **设置** → **Go 配置**
-2. 打开用量查询页面 <https://opencode.ai/workspace/wrk_xxx/go>，将 `wrk_xxx` 填入 **Workspace**
-3. 按 `F12` 打开开发者工具 → **应用程序** → **Cookie**，找到 `auth`，复制整段文本填入 **Cookie**
-4. 点击完成后重启 TUI
+Go 用量**自动读取你已登录的 OpenCode 凭证**（通过 `client.credential.list()` 取 Console OAuth token），
+调用官方端点 `GET https://opencode.ai/inference/go/v1/usage`，**无需任何手填配置**。
 
-也可复用 [opencode-go-usage](https://github.com/) 插件的配置文件 `~/.config/opencode/opencode-go-usage.json`，避免重复填 Cookie。
+- 只要你用 `/connect` 登录过 OpenCode Console（或 Go），侧边栏即自动显示 Go 套餐的滚动(5h)/本周/本月用量
+- 数据与 <https://opencode.ai/console> 一致（百分比 + 重置倒计时）
+- V1 的「手填 Workspace ID + Cookie」与页面抓取方案已移除（V2 页面不再服务端渲染，抓取已失效）
 
 ## 数据文件
 
@@ -79,7 +79,7 @@ npm install -g opencode-token-board
 | JSONL 日志 | `~/.opencode/tokenwatch.jsonl` | 性能样本（TTFT/TPS/延迟），5MB 自动轮转 |
 | 聚合统计 | `~/.opencode/tokenwatch-stats.json` | 持久化全量性能统计（报告用） |
 | 报告输出 | `~/.opencode/reports/` | HTML / JSON / Markdown 报告 |
-| 插件配置 | OpenCode 插件存储（`ctx.storage`） | 显示开关 / 语言 / Go 配置 / 折叠态 |
+| 插件配置 | OpenCode 插件存储（`ctx.storage`） | 显示开关 / 语言 / 折叠态 |
 
 > 报告的用量数据**直接读取 OpenCode 的 SQLite 数据库**（`~/.local/share/opencode/opencode.db`），
 > 无需 `opencode db` 命令（该命令已在 V2 删除）。实测 V2 的 `session_message` 表已包含全部历史数据。

@@ -218,26 +218,9 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
   }
   const isEnglish = (str: string) => /^[a-zA-Z\s\.\/]+$/.test(str)
 
-  // Go 配置变更时同步到 fetcher（触发立即刷新）
-  let lastGoWs = ""
-  let lastGoCookie = ""
-  const syncGoConfig = () => {
-    const g = config().go
-    const ws = g?.workspaceID ?? ""
-    const ck = g?.cookie ?? ""
-    if (ws && ck && (ws !== lastGoWs || ck !== lastGoCookie)) {
-      lastGoWs = ws
-      lastGoCookie = ck
-      props.goUsageFetcher?.setConfig(ws, ck)
-    }
-  }
-  syncGoConfig()
-
-  // 配置（含 Go）变化 → 同步 fetcher + 语言（响应式，无轮询）
+  // 配置变化 → 同步语言（响应式，无轮询）。Go 用量不再依赖手填配置（凭证自动读）。
   createEffect(() => {
-    const lang = config().language
-    setLanguage(lang)
-    syncGoConfig()
+    setLanguage(config().language)
   })
 
   // ── 面板宽度常量（写死 opencode 侧边栏，不做动态测量）──
@@ -258,7 +241,7 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
     void goUsageVersion()
     return props.goUsageFetcher?.data() ?? null
   })
-  const goConfigured = () => !!config().go?.workspaceID && !!config().go?.cookie
+  const goConfigured = () => goUsage() != null
 
   const goRows = createMemo(() => {
     const iconW = 2

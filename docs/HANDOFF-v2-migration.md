@@ -17,7 +17,7 @@
 | 4 | 命令与 Dialog（keymap + dialog） | ✅ 完成 | commands.tsx（Promise 化） |
 | 5 | 通知与权限拆除（attention + 删 notify） | ✅ 完成 | 删 notify.ts + 弹窗脚本；i18n 清理 |
 | 6 | 报告数据源（SQLite 直连） | ✅ 完成 | db.ts（新）/ queries.ts（重写，v2 schema） |
-| 7 | 全量增强（panel/router/status bar） | ⬜ **未做** | 见「遗留」 |
+| 7 | 全量增强（panel/router/status bar） | 🟡 已实现待 TUI 验收 | enhancements.tsx（新） |
 | 8 | 验收与发布 | 🟡 部分完成 | 类型/构建/数据/加载已验证；TUI 实测 + npm 发布待做 |
 
 **核心迁移（阶段 1-6）已全部完成并通过自动化验证。** 阶段 7 增强与阶段 8 的 TUI 实测/发布为遗留项。
@@ -40,7 +40,7 @@
 - 配置：`ctx.storage.store` 响应式 Store 替代 `api.kv` + 500ms 轮询（轮询已删）。
 
 ### 遗留（未做）
-1. **阶段 7 全量增强**：`session.panel` 全屏面板、`ui.router` dashboard、`sidebar.footer`/`home.footer.status` 状态条 —— 未开始（等核心 TUI 验收后再做）。
+1. **阶段 7 全量增强**：✅ 已实现（`src/enhancements.tsx`：① `sidebar.footer` 状态条 ② `session.panel` 全屏统计面板 ③ `ui.router` 仪表盘路由；`/usage` 菜单新增「统计面板」「仪表盘」入口），**待 TUI 验收**。
 2. **TUI 实测**：侧边栏渲染、`/usage` 菜单交互、theme 配色、宽度 38/36 布局假设、@opentui 0.6 组件兼容 —— 需开 TUI 人工验证（headless 无法测渲染）。
 3. **npm 发布**：package.json 版本已设 1.0.0，但未执行 `npm publish`。
 4. **全局配置本地路径不加载**：实测全局 `plugins: ["file:///D:/..."]` 启动时不加载；`.opencode/plugins/` 可靠加载（项目级）；npm 包名从 `~/.cache/opencode/npm/` 缓存加载。
@@ -60,7 +60,16 @@ opencode service restart
 注入后日志出现 `loading plugin .../dist/server.js` 且**无** `failed to load` WARN = 干净加载。
 （时间戳子目录可能随重新拉取变化；`@opentui/*`/`solid-js`/`@opencode/plugin` 由宿主运行时提供，无需在缓存装依赖。）
 
+### Go 用量改用官方 API（2026-10-15 追加）
+- **发现**：`GET https://opencode.ai/inference/go/v1/usage` + `Authorization: Bearer <OpenCode OAuth access token>` 返回与网页一致的三桶数据（rolling/weekly/monthly 百分比 + resetsAt）。OAuth token 与 Go key 均实测 200。
+- **凭证来源**：插件用 `context.client.credential.list()` 取 `integrationID==="opencode"` 的 active OAuth 凭证 `.value.access`（opencode 自管 + 自动刷新）；零手填配置。（`opencode-go` 集成 `connections:[]`，插件 API 拿不到，故用 `opencode` 的 OAuth，实测它也能调该端点。）
+- **旧方案已死**：v1 抓页面（RPC `lite.subscription.get` + SSR 解析）在 v2 失效——实测 `/workspace/{id}/go` 返回空壳、无 SSR 数据。
+- **实现**：重写 `go-usage.ts`（删 3 种抓取法 → 单次 GET + token 解析器注入）；`tui.tsx` 注入 `makeGoTokenResolver`；删手填 Go 配置 UI（commands.tsx）与 `SidebarConfig.go` 字段；sidebar `goConfigured()` 改为「有数据即显示」。
+- **验证**：`scripts/test-go-usage.ts` 端到端 ALL PASSED（rolling 10%/292s、weekly 4%、monthly 2%）。
+
 ### 踩坑记录
+- **v1 插件配置迁移缺口**：v1 的 `api.kv`（Go 配置 / 侧边栏开关 / 语言）在 v1→v2 迁移中**不会自动带入** v2 `ctx.storage.store`（实测 v2 kv 表仅 3 个系统键，无 v1 插件数据；`~/.opencode/` 仅有 perf 数据文件）。用户需经 `/usage → 设置` 重新配置。perf 数据（tokenwatch.jsonl/stats.json）与报告不受影响。
+- **状态条冗余**：阶段 7 的 `sidebar.footer` 状态条与侧边栏面板顶部「四项总计」重复，已按用户要求删除；保留全屏面板 + 仪表盘。
 - **PowerShell `Set-Content` 用系统 ANSI 编码损坏 UTF-8**：对含中文/箭头的源文件用 `-replace ... Set-Content` 会把 `→` 等多字节字符变 `�?`。已用 write 工具重写受影响文件（commands/sidebar/storage/tui/server）修复。**后续改 UTF-8 源文件一律用 write/edit 工具，禁用 PowerShell Set-Content。**
 - `Context` 类型需从子路径 `@opencode/plugin/tui/context` 导入（index 只导出 `Plugin` 命名空间）。
 - `session.message.content.updated` 事件不在 `data.on` 联合里 → 改用 `session.step.streamed`。

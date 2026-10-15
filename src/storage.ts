@@ -31,7 +31,6 @@ function mergeOptionsWithDefaults(options: Readonly<Record<string, any>>): Sideb
   return {
     sidebar: { ...DEFAULT_SIDEBAR_CONFIG.sidebar, ...(opts?.sidebar ?? {}) },
     language: opts?.language ?? DEFAULT_SIDEBAR_CONFIG.language,
-    go: opts?.go ? { ...opts.go } : undefined,
   }
 }
 

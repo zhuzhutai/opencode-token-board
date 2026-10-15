@@ -2,18 +2,15 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { Context } from "@opencode/plugin/tui/context"
 import { createSignal } from "solid-js"
-import { readFileSync } from "node:fs"
-import { join } from "node:path"
-import { homedir } from "node:os"
 import { registerCommands } from "./commands.js"
 import { PerfRecorder } from "./perf-tracker.js"
 import { extractTokenMessages } from "./mapper.js"
 import { createGoUsageFetcher } from "./go-usage.js"
-import type { GoUsageFetcher } from "./go-usage.js"
+import type { TokenResolver } from "./go-usage.js"
 import { createBoardStorage } from "./storage.js"
-import type { BoardStorage } from "./storage.js"
 import { setLanguage, t } from "./i18n.js"
 import { TokenWatchPanel } from "./sidebar.js"
+import { registerEnhancements } from "./enhancements.js"
 
 /**
  * ══════════════════════════════════════════════════════════════════
@@ -37,31 +34,28 @@ import { TokenWatchPanel } from "./sidebar.js"
 /** 事件触发的同步/记录去抖间隔（毫秒）。合并同一帧内的密集事件。 */
 const SYNC_DEBOUNCE_MS = 60
 
-function loadGoConfig(storage: BoardStorage, fetcher: GoUsageFetcher): void {
-  // 优先插件配置（storage），其次复用 opencode-go-usage 插件的配置文件，避免重复填 Cookie
-  const go = storage.config.go
-  if (go?.workspaceID && go?.cookie) {
-    fetcher.setConfig(go.workspaceID, go.cookie)
-    return
+/** 从 opencode 集成的 active OAuth 凭证取 access token（供 Go 用量 API 使用）。 */
+function makeGoTokenResolver(context: Context): TokenResolver {
+  return async () => {
+    try {
+      const creds = await context.client.credential.list()
+      const oc = creds.find((c) => c.integrationID === "opencode" && c.active)
+      if (oc?.value?.type === "oauth" && oc.value.access) return oc.value.access
+    } catch { /* 无凭证/未登录 */ }
+    return undefined
   }
-  try {
-    const cfgFile = join(homedir(), ".config", "opencode", "opencode-go-usage.json")
-    const raw = JSON.parse(readFileSync(cfgFile, "utf-8")) as { workspaceId?: string; authCookie?: string }
-    if (raw?.workspaceId && raw?.authCookie) fetcher.setConfig(raw.workspaceId, raw.authCookie)
-  } catch { /* 无配置则不启用 Go 显示 */ }
 }
 
 export default Plugin.define({
   id: "opencode-token-board",
   async setup(context) {
     const perfRecorder = new PerfRecorder()
-    const goUsageFetcher = createGoUsageFetcher()
+    const goUsageFetcher = createGoUsageFetcher(makeGoTokenResolver(context))
     const storage = createBoardStorage(context)
     const cleanups: (() => void)[] = []
 
     // 同步语言（侧边栏首帧即用正确语言）
     setLanguage(storage.config.language)
-    loadGoConfig(storage, goUsageFetcher)
 
     // 「当前侧边栏显示的会话」（普通变量：事件处理器仅用于判断是否刷新侧边栏，无需响应式）
     let currentSessionID = ""
@@ -117,6 +111,9 @@ export default Plugin.define({
 
     // ── 命令（/usage 菜单）──
     cleanups.push(registerCommands(context, storage))
+
+    // ── 增强（阶段 7）：状态条 / 全屏面板 / 仪表盘路由 ──
+    cleanups.push(registerEnhancements(context, storage, version))
 
     // ── 侧边栏槽位 ──
     cleanups.push(context.ui.slot({

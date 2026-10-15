@@ -8,6 +8,7 @@ import { generateUsageHtml } from "./generate-usage-html.js"
 import { readLogs } from "./perf-tracker.js"
 import { readPersistedStats } from "./stats-store.js"
 import { setLanguage, t } from "./i18n.js"
+import { openStatsPanel, openDashboard } from "./enhancements.js"
 import { existsSync, mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -192,36 +193,11 @@ async function showLanguageMenu(context: Context, storage: BoardStorage): Promis
   }
 }
 
-async function showGoConfigMenu(context: Context, storage: BoardStorage): Promise<void> {
-  for (;;) {
-    const go = storage.config.go ?? {}
-    const choice = await context.ui.dialog.select<"workspaceID" | "cookie" | "clear" | "done">({
-      title: t("goConfigTitle"),
-      placeholder: t("descGoConfig"),
-      options: [
-        { title: `${go.workspaceID ? "✓ " : "  "}${t("setWorkspaceId")}${go.workspaceID ? " · " + go.workspaceID : ""}`, value: "workspaceID" },
-        { title: `${go.cookie ? "✓ " : "  "}${t("setCookie")}`, value: "cookie" },
-        { title: t("clearGoConfig"), value: "clear" },
-        { title: t("done"), value: "done" },
-      ],
-    })
-    if (choice === "workspaceID") {
-      const v = await context.ui.dialog.prompt({ title: t("goWorkspaceId"), placeholder: "wrk_xxx", value: go.workspaceID ?? "" })
-      if (v !== undefined) await storage.updateConfig((d) => { d.go = { ...(d.go ?? {}), workspaceID: v.trim() } })
-    } else if (choice === "cookie") {
-      const v = await context.ui.dialog.prompt({ title: t("goCookie"), value: go.cookie ?? "" })
-      if (v !== undefined) await storage.updateConfig((d) => { d.go = { ...(d.go ?? {}), cookie: v.trim() } })
-    } else if (choice === "clear") {
-      await storage.updateConfig((d) => { d.go = {} })
-    } else return
-  }
-}
-
 async function showSettingsMenu(context: Context, storage: BoardStorage): Promise<void> {
   for (;;) {
     const cfg = storage.config
     const choice = await context.ui.dialog.select<
-      "showPerformance" | "showTokenDistribution" | "showGoUsage" | "goConfig" | "language" | "done"
+      "showPerformance" | "showTokenDistribution" | "showGoUsage" | "language" | "done"
     >({
       title: t("settingsTitle"),
       placeholder: t("settingsPlaceholder"),
@@ -229,7 +205,6 @@ async function showSettingsMenu(context: Context, storage: BoardStorage): Promis
         { title: `${cfg.sidebar.showPerformance ? "✓ " : "  "}${t("showPerformance")}`, value: "showPerformance", description: t("descShowPerformance") },
         { title: `${cfg.sidebar.showTokenDistribution ? "✓ " : "  "}${t("showTokenDistribution")}`, value: "showTokenDistribution", description: t("descShowTokenDistribution") },
         { title: `${cfg.sidebar.showGoUsage ? "✓ " : "  "}${t("showGoUsage")}`, value: "showGoUsage", description: t("descShowGoUsage") },
-        { title: `${t("goConfigTitle")} ▸`, value: "goConfig", description: t("descGoConfig") },
         { title: `${t("settingsLanguage")} ▸`, value: "language", description: t("descSettingsLanguage") },
         { title: t("done"), value: "done", description: t("closeSettings") },
       ],
@@ -237,7 +212,6 @@ async function showSettingsMenu(context: Context, storage: BoardStorage): Promis
     if (choice === "showPerformance") await storage.updateConfig((d) => { d.sidebar.showPerformance = !d.sidebar.showPerformance })
     else if (choice === "showTokenDistribution") await storage.updateConfig((d) => { d.sidebar.showTokenDistribution = !d.sidebar.showTokenDistribution })
     else if (choice === "showGoUsage") await storage.updateConfig((d) => { d.sidebar.showGoUsage = !d.sidebar.showGoUsage })
-    else if (choice === "goConfig") await showGoConfigMenu(context, storage)
     else if (choice === "language") await showLanguageMenu(context, storage)
     else return
   }
@@ -246,19 +220,23 @@ async function showSettingsMenu(context: Context, storage: BoardStorage): Promis
 async function showUsageMenu(context: Context, storage: BoardStorage): Promise<void> {
   setLanguage(storage.config.language)
   for (;;) {
-    const choice = await context.ui.dialog.select<"html" | "json" | "text" | "settings">({
+    const choice = await context.ui.dialog.select<"html" | "json" | "text" | "panel" | "dashboard" | "settings">({
       title: t("panelTitle"),
       placeholder: "Select an action...",
       options: [
         { title: `${t("cmdTitleHtml")} ▸`, value: "html", description: t("cmdDescHtml") },
         { title: t("cmdTitleJson"), value: "json", description: t("cmdDescJson") },
         { title: t("cmdTitleText"), value: "text", description: t("cmdDescText") },
+        { title: `${t("cmdTitlePanel")} ▸`, value: "panel", description: t("cmdDescPanel") },
+        { title: `${t("cmdTitleDashboard")} ▸`, value: "dashboard", description: t("cmdDescDashboard") },
         { title: `${t("cmdTitleSettings")} ▸`, value: "settings", description: t("cmdDescSettings") },
       ],
     })
     if (choice === "html") await showHtmlRangeMenu(context)
     else if (choice === "json") await showJsonExport(context)
     else if (choice === "text") await showTextReport(context)
+    else if (choice === "panel") { context.ui.dialog.clear(); openStatsPanel(context); return }
+    else if (choice === "dashboard") { context.ui.dialog.clear(); openDashboard(context); return }
     else if (choice === "settings") await showSettingsMenu(context, storage)
     else return
   }
