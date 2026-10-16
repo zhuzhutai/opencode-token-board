@@ -12,13 +12,17 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import type { LogEntry, ModelPerfStats } from "./formatter.js"
-import { computeTps } from "./formatter.js"
+import { computeTps, MAX_PLAUSIBLE_TPS_ESTIMATED } from "./formatter.js"
 
 const STATS_PATH = join(homedir(), ".opencode", "tokenwatch-stats.json")
 const LOG_PATH = join(homedir(), ".opencode", "tokenwatch.jsonl")
 const RESERVOIR_SIZE = 500   // 每个指标最多保留的原始样本数
 // v2: TPS 分子纳入 reasoning token（旧版仅用 output，系统性低估生成速度）
-const CURRENT_VERSION = 2
+// v3: TPS 分母改为「首 token → 流式结束」的生成窗口（v2 用 completed-streamed = 工具耗时，会算出几千的假值）
+// v4: TPS 口径与 OpenCode 官方对齐 —— 生成窗口 = streamed − created（step 开始 → 流式结束，含预填充），
+//     分子 = output + reasoning。v3 的窗口（排除预填充）会高估于官方值，故再次作废重算。
+//     TTFT 口径不变（首 token − step 开始）。
+const CURRENT_VERSION = 4
 
 /** 持久化存储的单模型统计（含原始样本用于分位数计算） */
 interface PersistedModelStats {
@@ -73,14 +77,56 @@ function loadStatsFile(): StatsFile {
     if (existsSync(STATS_PATH)) {
       const content = readFileSync(STATS_PATH, "utf-8")
       const parsed = JSON.parse(content) as StatsFile
-      if (parsed?.version === CURRENT_VERSION && parsed.models) {
-        cachedFile = parsed
+      if (parsed?.models && typeof parsed.version === "number") {
+        if (parsed.version === CURRENT_VERSION) {
+          cachedFile = parsed
+          return cachedFile
+        }
+        // 任意旧版本：用量/成本/延迟聚合结构稳定，原样保留；
+        // 性能聚合（TTFT/TPS）口径已变，全部作废后从 JSONL 按新口径重算（见 upgradePerf）。
+        cachedFile = upgradePerf(parsed)
+        dirty = true
+        flushStatsFile()   // 升级结果立即落盘，避免下次启动重复升级
         return cachedFile
       }
     }
   } catch { /* 文件损坏时返回空白统计 */ }
   cachedFile = { version: CURRENT_VERSION, updatedAt: "", migratedFromLogs: false, models: {} }
   return cachedFile
+}
+
+/**
+ * 旧版本 → v4 一次性升级：用量/成本/延迟聚合原样保留，作废被算错的 TTFT/TPS 聚合，
+ * 再从 JSONL 按新口径补回 TPS；TTFT 历史直接丢弃（无首 token 信息，宁缺毋滥）。
+ *
+ * 兼容 v1~v3：三者的 models 结构一致，且都用「保留用量 + 重算性能」的语义即可。
+ * JSONL 里旧条目没有 `basis`，其 `ttft_ms` 正是「step 开始 → 流式结束」（官方生成窗口），
+ * 迁移时按它重算 TPS（见 entryTps）。
+ */
+function upgradePerf(file: StatsFile): StatsFile {
+  file.version = CURRENT_VERSION
+  for (const s of Object.values(file.models)) {
+    s.ttftCount = 0
+    s.avgTTFT = null; s.maxTTFT = null; s.minTTFT = null
+    s.ttftReservoir = []
+    s.tpsCount = 0
+    s.avgTPS = null; s.maxTPS = null; s.minTPS = null
+  }
+  // 旧版已做过全量迁移：这里只补性能口径，绝不能重复计入 requestCount/token（migrateFromLogs 逻辑会全量重跑）
+  file.migratedFromLogs = true
+  if (existsSync(LOG_PATH)) {
+    try {
+      const content = readFileSync(LOG_PATH, "utf-8").trim()
+      for (const line of content.split("\n")) {
+        if (!line) continue
+        try {
+          const entry = JSON.parse(line) as LogEntry
+          if (entry.model) applyEntryPerf(file.models, entry)
+        } catch { /* 跳过格式损坏的行 */ }
+      }
+    } catch { /* 日志不可读则保留零值，后续增量写入会重新累积 */ }
+  }
+  return file
 }
 
 /** 立即落盘（仅在 dirty 时）。 */
@@ -143,18 +189,57 @@ function reservoirAdd(reservoir: number[], value: number, totalCount: number): n
 // ─────────────────────────────────────────────
 
 /**
- * 从日志条目还原"修正后"的 TPS。
+ * 从日志条目取可信 TTFT。
  *
- * 迁移历史日志时，旧条目的 `tps` 字段是用 output/genMs 算出的（漏掉了 reasoning），
- * 不能直接信任。这里用同一条目的 latency_ms 与 ttft_ms 反推生成窗口
- * （latency - ttft == completed - firstPart == genMs），再按新口径重算，
- * 从而让全量历史统计与新版一致。
+ * 只有 `basis` 存在的条目（v4 起，"live"/"content"）其 ttft_ms 才是「首 token − step 开始」；
+ * 更早的条目 ttft_ms 实为「step 开始 → 流结束」（预填充 + 整段生成），不是 TTFT，直接丢弃。
+ * "approx" 条目 ttft_ms 本身为 null，天然不会被计入。
  */
-function effectiveTps(entry: LogEntry): number | null {
-  const genMs = entry.latency_ms != null && entry.ttft_ms != null
-    ? entry.latency_ms - entry.ttft_ms
-    : null
-  return computeTps(entry.outputTokens, entry.reasoningTokens, genMs) ?? entry.tps
+function entryTtft(entry: LogEntry): number | null {
+  return entry.basis === undefined ? null : entry.ttft_ms
+}
+
+/**
+ * 从日志条目取可信 TPS。
+ *
+ * - 新条目（有 basis，v4 起）：tracker 已按官方口径算好（本身已过合理性上限），直接采信；
+ * - 旧条目（无 basis）：历史 ttft_ms 字段正是「step 开始 → 流式结束」窗口，
+ *   恰等于官方生成窗口，拿它重算即可；若该窗口离谱（极短 ttft 配大 token），
+ *   退到端到端延迟窗口（含工具耗时，更低估但有界），再不行才放弃——绝不写入上千的假值。
+ */
+function entryTps(entry: LogEntry): number | null {
+  if (entry.basis !== undefined) return entry.tps
+  const t1 = computeTps(entry.outputTokens, entry.reasoningTokens, entry.ttft_ms)
+  if (t1 != null && t1 <= MAX_PLAUSIBLE_TPS_ESTIMATED) return t1
+  const t2 = computeTps(entry.outputTokens, entry.reasoningTokens, entry.latency_ms)
+  if (t2 != null && t2 <= MAX_PLAUSIBLE_TPS_ESTIMATED) return t2
+  return null
+}
+
+/** 把两个性能样本并入聚合（TTFT / TPS 各自独立计数）。 */
+function accumulatePerf(s: PersistedModelStats, ttft: number | null, tps: number | null): void {
+  if (ttft != null) {
+    s.ttftCount++
+    const c = s.ttftCount
+    s.avgTTFT = s.avgTTFT != null ? s.avgTTFT + (ttft - s.avgTTFT) / c : ttft
+    s.maxTTFT = s.maxTTFT != null ? Math.max(s.maxTTFT, ttft) : ttft
+    s.minTTFT = s.minTTFT != null ? Math.min(s.minTTFT, ttft) : ttft
+    s.ttftReservoir = reservoirAdd(s.ttftReservoir, ttft, s.ttftCount)
+  }
+  if (tps != null) {
+    s.tpsCount++
+    const c = s.tpsCount
+    s.avgTPS = s.avgTPS != null ? s.avgTPS + (tps - s.avgTPS) / c : tps
+    s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, tps) : tps
+    s.minTPS = s.minTPS != null ? Math.min(s.minTPS, tps) : tps
+  }
+}
+
+/** 只并入性能指标（不碰 requestCount/token/cost/延迟），供 v2→v3 升级补算使用。 */
+function applyEntryPerf(models: Record<string, PersistedModelStats>, entry: LogEntry): void {
+  const s = models[entry.model]
+  if (!s) return
+  accumulatePerf(s, entryTtft(entry), entryTps(entry))
 }
 
 function applyEntryToModels(models: Record<string, PersistedModelStats>, entry: LogEntry): void {
@@ -189,25 +274,8 @@ function applyEntryToModels(models: Record<string, PersistedModelStats>, entry: 
   s.totalCacheWrite += entry.cacheWriteTokens
   s.totalCost += entry.cost
 
-  if (entry.ttft_ms != null) {
-    s.ttftCount++
-    const c = s.ttftCount
-    s.avgTTFT = s.avgTTFT != null ? s.avgTTFT + (entry.ttft_ms - s.avgTTFT) / c : entry.ttft_ms
-    s.maxTTFT = s.maxTTFT != null ? Math.max(s.maxTTFT, entry.ttft_ms) : entry.ttft_ms
-    s.minTTFT = s.minTTFT != null ? Math.min(s.minTTFT, entry.ttft_ms) : entry.ttft_ms
-    s.ttftReservoir = reservoirAdd(s.ttftReservoir, entry.ttft_ms, s.ttftCount)
-  }
-
-  // 新日志（带 reasoningStreamed 标记）直接信任 tracker 写入的 tps；
-  // 旧日志（无该字段）用修正口径重算，保证迁移后历史数据不低估。
-  const tps = entry.reasoningStreamed === undefined ? effectiveTps(entry) : entry.tps
-  if (tps != null) {
-    s.tpsCount++
-    const c = s.tpsCount
-    s.avgTPS = s.avgTPS != null ? s.avgTPS + (tps - s.avgTPS) / c : tps
-    s.maxTPS = s.maxTPS != null ? Math.max(s.maxTPS, tps) : tps
-    s.minTPS = s.minTPS != null ? Math.min(s.minTPS, tps) : tps
-  }
+  // 性能样本按日志口径取数（旧日志 TTFT 丢弃、TPS 按近似窗口重算，见 entryTtft/entryTps）
+  accumulatePerf(s, entryTtft(entry), entryTps(entry))
 
   if (entry.latency_ms != null) {
     s.latencyCount++

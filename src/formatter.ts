@@ -131,8 +131,11 @@ export function formatDuration(ms: number | null): string {
  * 推理耗时。若分子只取 output，会系统性低估真实生成速度。
  *
  * @param outputTokens    可见输出 token 数
- * @param reasoningTokens 推理 token 数（仅当确实流式生成时才应计入）
- * @param genMs           生成窗口时长（首个 token 到消息完成），毫秒
+ * @param reasoningTokens 推理 token 数（与 output 同处一个流式窗口，应计入）
+ * @param genMs           生成窗口时长（毫秒）。**必须与 OpenCode 官方口径一致**：
+ *                        `streamed - created`（step 开始 → 流式输出结束，含预填充）。
+ *                        这是历史上 TPS 冲上几千的根因所在——旧代码误用
+ *                        `completed - streamed`（工具执行耗时，常 <100ms）当分母。
  */
 export function computeTps(
   outputTokens: number,
@@ -144,6 +147,18 @@ export function computeTps(
   if (generated <= 0) return null
   return (generated / genMs) * 1000
 }
+
+/**
+ * TPS 合理性上限（tok/s）。仅作兜底防线：正常情况下官方口径（streamed − created）
+ * 落在大约 10~300，极少超过 1000。超过上限说明时间戳异常（窗口塌缩/时钟漂移），
+ * 此时置 null，而不是把假值写进统计。
+ *
+ * 保留两个常量以兼容 stats-store 的历史日志迁移：
+ *   OBSERVED  = 当前口径（实时/持久化时间戳齐备）的宽松上限
+ *   ESTIMATED = 由近似时间戳推算时的从严上限
+ */
+export const MAX_PLAUSIBLE_TPS_OBSERVED = 2000
+export const MAX_PLAUSIBLE_TPS_ESTIMATED = 1000
 
 export function formatFilters(filters: UsageFilters): string {
   const parts: string[] = []
@@ -491,6 +506,17 @@ export interface TokenDistribution {
   total: number
 }
 
+/**
+ * TPS/TTFT 取数口径（见 LogEntry.basis）。
+ *
+ * TPS 口径已统一为 OpenCode 官方公式（`(output+reasoning)/((streamed-created)/1000)`），
+ * 因此 basis 现在只描述 **TTFT 的来源**（TPS 恒为官方口径）：
+ *   "live"    = 实时采集到首个 token delta
+ *   "content" = 用消息首个内容分片 time.created 作首 token
+ *   "approx"  = 无首 token 依据（TTFT 为 null），TPS 仍按官方窗口算
+ */
+export type TpsBasis = "live" | "content" | "approx"
+
 export interface LogEntry {
   ts: string
   model: string
@@ -508,9 +534,19 @@ export interface LogEntry {
   cost: number
   /**
    * 本次请求的 reasoning token 是否以流式 part 产出。
-   * 旧版日志无此字段（undefined），迁移时据此判断需要重算 TPS。
+   * 旧版日志无此字段（undefined）。已被 `basis` 取代，保留仅为兼容历史日志。
    */
   reasoningStreamed?: boolean
+  /**
+   * TPS/TTFT 的取数口径（v4 起写入）：
+   *   "live"    = 实时采集到首个 token，TTFT 为实测值
+   *   "content" = 用消息首个内容分片 time.created 作首 token
+   *   "approx"  = 无首 token 依据（ttft_ms 为 null）
+   *   TPS 自 v4 起恒为 OpenCode 官方口径（streamed − created），与本字段无关。
+   *   缺失（undefined）= 旧版日志（v1~v3）：`ttft_ms` 当时的语义是「step 开始 → 流式结束」，
+   *                     正好等于官方生成窗口 → 迁移时直接用它重算 TPS，TTFT 丢弃。
+   */
+  basis?: TpsBasis
 }
 
 // ── HTML report types ──

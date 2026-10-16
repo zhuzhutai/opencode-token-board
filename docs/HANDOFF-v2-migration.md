@@ -164,11 +164,21 @@ opencode service restart
 - `ModelRef` = `{id, providerID, variant?}`（嵌套）
 - `TokenUsageInfo` = `{input, output, reasoning, cache:{read,write}}` — **无 total**
 - `content` 子类型：`{type:"text",text}` / `{type:"reasoning",text,time}` / `{type:"tool",id,name,state,time}`
-- **性能指标可从消息自身算**（比 v1 更简洁）：
-  - TTFT = `time.streamed - time.created`
-  - 延迟 = `time.completed - time.created`
-  - TPS = `output / (time.completed - time.streamed)`
-  - ⇒ 不再需要 v1 的 firstPartTimes 跨事件追踪
+- ~~**性能指标可从消息自身算**~~（⚠️ 该结论已被实测推翻，见下方修正）：
+  - ~~TTFT = `time.streamed - time.created`~~
+  - 延迟 = `time.completed - time.created` ✅（仍成立）
+  - ~~TPS = `output / (time.completed - time.streamed)`~~
+  - ⇒ ~~不再需要 v1 的 firstPartTimes 跨事件追踪~~
+
+> **⚠️ 修正（TPS/TTFT 口径）**：`time.streamed` 是**流式输出结束**（`session.step.streamed`
+> 每 step 只发一次且在流跑完后 publish），`time.completed` 是**工具执行完的 step 收尾**。
+> 因此 `completed - streamed` 是**工具耗时**（无工具时常 <100ms），用它当 TPS 分母会算出
+> 上千上万的假值（本机实测旧口径 p50=1416 TPS、max=100538）；`streamed - created` 是
+> 「预填充 + 整段生成」，也不是 TTFT。
+> 现行实现（src/perf-tracker.ts `derivePerf` + src/stream-timing.ts）：
+> ① 首 token 优先取实时采集的首个 delta（text/reasoning/tool.input 事件的 `event.created`），
+> ② 其次取消息 `content[0].time.created`（reasoning/tool 开头的历史消息可用），
+> ③ 再退到「step 开始 → 流结束」近似窗口（无 TTFT），并用 `MAX_PLAUSIBLE_TPS` 兜底防假值。
 
 ### G. Theme
 - `context.theme` 是 `ResolvedTheme`（语义 token 树，值为 `@opentui/core` 的 RGBA）

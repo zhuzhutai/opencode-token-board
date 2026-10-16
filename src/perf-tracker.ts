@@ -1,7 +1,8 @@
-import type { LogEntry, ModelPerfStats, SessionPerfStats } from "./formatter.js"
-import { computeTps } from "./formatter.js"
+import type { LogEntry, ModelPerfStats, SessionPerfStats, TpsBasis } from "./formatter.js"
+import { computeTps, MAX_PLAUSIBLE_TPS_OBSERVED } from "./formatter.js"
 import type { TokenMessage } from "./types.js"
 import { hasPerfTiming } from "./types.js"
+import { getStreamTiming } from "./stream-timing.js"
 import { appendFileSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -45,19 +46,64 @@ export interface PerfSample {
   ttft: number | null
   latency: number | null
   tps: number | null
+  /**
+   * TTFT 的取数口径（TPS 自 v4 起恒为官方口径，与本字段无关）：
+   *   live    = 实时抓到首个 token delta
+   *   content = 消息首个内容分片的 time.created
+   *   approx  = 无首 token 依据（TTFT 为 null）
+   *   null    = 完全无性能数据
+   */
+  basis: TpsBasis | null
 }
 
+/**
+ * 推导 TTFT / 延迟 / TPS。
+ *
+ * 时间字段真实语义（与 OpenCode core 对齐，勿按字段名望文生义）：
+ *   created   = step 开始（发请求）
+ *   streamed  = 流式输出结束（session.step.streamed，在流跑完后 publish）
+ *   completed = step 收尾（工具执行完）
+ *
+ * ── TPS：严格对齐 OpenCode 官方口径 ──
+ * 官方源码（v2.0.29 TUI footer）：
+ *   TPS = Σ(output + reasoning) / (Σ(streamed − created) / 1000)
+ * 即「step 开始 → 流式结束」为生成窗口（含预填充）。逐条消息等价于
+ *   (output + reasoning) / ((streamed − created) / 1000)
+ * 历史 bug：旧代码误用 `completed − streamed`（工具执行耗时，常 <100ms）当分母，
+ * 于是 TPS 动辄上千（实测 avg 1150、max 26000），而官方只有几十~两百。
+ *
+ * ── TTFT：首 token − step 开始（官方不展示）──
+ * 首 token 时间来源（按优先级）：
+ *   ① stream-timing.ts 实时采集的首个 delta
+ *   ② 消息首个内容分片的 time.created（reasoning/tool 开头的消息可用）
+ *   ③ 都没有 → TTFT 置 null（宁缺毋滥）
+ */
 export function derivePerf(m: TokenMessage): PerfSample {
-  if (!hasPerfTiming(m)) return { ttft: null, latency: null, tps: null }
+  if (!hasPerfTiming(m)) return { ttft: null, latency: null, tps: null, basis: null }
   const created = m.created!
   const completed = m.completed!
   const latency = completed - created
-  const ttft = typeof m.streamed === "number" && m.streamed > 0 ? m.streamed - created : null
-  // TPS：计入 reasoning token（推理与可见输出同处一个流式窗口，只算 output 会低估）。
-  // 无可靠 streamed 则 genMs 为 null → tps null（宁缺毋滥）。
-  const genMs = ttft !== null && completed > m.streamed! ? completed - m.streamed! : null
-  const tps = computeTps(m.outputTokens, m.reasoningTokens, genMs)
-  return { ttft, latency, tps }
+
+  // TPS —— 官方口径：生成窗口 = streamed − created（含预填充）
+  const streamEnd = typeof m.streamed === "number" && m.streamed > 0 ? m.streamed : null
+  let tps: number | null = null
+  if (streamEnd !== null && streamEnd > created) {
+    const t = computeTps(m.outputTokens, m.reasoningTokens, streamEnd - created)
+    if (t !== null && t <= MAX_PLAUSIBLE_TPS_OBSERVED) tps = t
+  }
+
+  // TTFT —— 首 token − step 开始（实时采集优先，其次首个内容分片）
+  const live = getStreamTiming(m.id)
+  let first: number | null = null
+  if (live && live.first >= created) first = live.first
+  else if (typeof m.firstTokenAt === "number" && m.firstTokenAt >= created) first = m.firstTokenAt
+  const ttft = first !== null ? first - created : null
+
+  let basis: TpsBasis | null = null
+  if (tps !== null || ttft !== null) {
+    basis = first === null ? "approx" : live && first === live.first ? "live" : "content"
+  }
+  return { ttft, latency, tps, basis }
 }
 
 /**
@@ -133,7 +179,7 @@ export function computePerfStats(messages: readonly TokenMessage[]): SessionPerf
 
 /** 由 TokenMessage 生成一条 JSONL 日志样本。 */
 export function toLogEntry(m: TokenMessage): LogEntry {
-  const { ttft, latency, tps } = derivePerf(m)
+  const { ttft, latency, tps, basis } = derivePerf(m)
   return {
     ts: new Date().toISOString(),
     model: `${m.providerID}/${m.modelID}`,
@@ -142,6 +188,8 @@ export function toLogEntry(m: TokenMessage): LogEntry {
     sessionID: m.sessionID,
     ttft_ms: ttft,
     tps,
+    // basis 存在 = 本条日志按 v3 口径产出（迁移时据此区分新旧日志）；null → 不写，按旧日志处理
+    basis: basis ?? undefined,
     latency_ms: latency,
     inputTokens: m.inputTokens,
     outputTokens: m.outputTokens,

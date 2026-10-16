@@ -4,6 +4,7 @@ import type { Context } from "@opencode/plugin/tui/context"
 import { createSignal } from "solid-js"
 import { registerCommands } from "./commands.js"
 import { PerfRecorder } from "./perf-tracker.js"
+import { noteStreamToken, resetStreamTiming } from "./stream-timing.js"
 import { extractTokenMessages } from "./mapper.js"
 import { createGoUsageFetcher } from "./go-usage.js"
 import type { TokenResolver } from "./go-usage.js"
@@ -24,7 +25,9 @@ import { registerEnhancements } from "./enhancements.js"
  *  · 事件：`api.event.on(type, cb)` + `event.properties` → `ctx.data.on(type, cb)` + `event.data`
  *  · 数据源：v1 逐 `message.updated` 抠 token → v2 以 `ctx.data.session.message.list()`
  *    为**唯一事实源**，事件仅作「触发同步 + 重算」信号（更稳、自愈，会话切换免轮询）
- *  · 性能指标：从消息自身 `time.{created,streamed,completed}` 直接算，无需跨事件追踪首 part
+ *  · 性能指标：延迟取自消息 `time.{created,completed}`；TPS 用官方口径（`streamed - created`，
+ *    见 perf-tracker.derivePerf）；TTFT 的首 token 时刻靠订阅 text/reasoning/tool-input
+ *    delta 事件**实时**记录（`time.streamed` 实为流结束，不含首 token 信息）
  *  · 持久化：`api.kv`（同步、非响应、需轮询版本号）→ `ctx.storage.store`（同步读 + 响应式）
  *  · 通知：自建 Windows 弹窗 → `ctx.attention.notify`（原生系统通知 + 音效）
  *  · 权限弹窗：**整条链路删除**（退回 v2 TUI 原生权限提示），见需求边界
@@ -86,6 +89,17 @@ export default Plugin.define({
     }
 
     // ── 事件订阅（payload 在 event.data.*）──
+    // 实时记录每个 assistant 消息的首 token 时刻（TTFT 的唯一来源）：
+    // 消息自带的 time.streamed 是「流结束」、time.completed 是「工具执行完」，
+    // 都没有首 token 时间；TPS 用官方口径（streamed - created）无需实时数据，
+    // 但 TTFT 必须靠这里实时采集（见 stream-timing.ts）。
+    cleanups.push(context.data.on("session.step.started", (e) => resetStreamTiming(e.data.assistantMessageID)))
+    cleanups.push(context.data.on("session.text.started", (e) => noteStreamToken(e.data.assistantMessageID, e.created)))
+    cleanups.push(context.data.on("session.text.delta", (e) => noteStreamToken(e.data.assistantMessageID, e.created)))
+    cleanups.push(context.data.on("session.reasoning.started", (e) => noteStreamToken(e.data.assistantMessageID, e.created)))
+    cleanups.push(context.data.on("session.reasoning.delta", (e) => noteStreamToken(e.data.assistantMessageID, e.created)))
+    // 工具参数也是 provider 侧的 output token，纳入生成窗口（分子分母口径一致）
+    cleanups.push(context.data.on("session.tool.input.delta", (e) => noteStreamToken(e.data.assistantMessageID, e.created)))
     // 每个 assistant step 完成 → 同步该会话 + 记录（跨会话历史性能也由此捕获）
     cleanups.push(context.data.on("session.step.ended", (e) => scheduleRecord(e.data.sessionID)))
     // 流式增量 / 用量更新 / 执行成功 → 若是当前会话则刷新侧边栏（token 分布等实时更新）

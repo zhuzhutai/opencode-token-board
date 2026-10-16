@@ -10,7 +10,9 @@ import type { TokenMessage } from "./types.js"
  * 结构差异（vs v1）：
  *   - 模型：`msg.model.{id,providerID}`（嵌套）取代平铺 `modelID`/`providerID`
  *   - tokens：无 `total`，只有 input/output/reasoning/cache.{read,write}
- *   - 时间：`msg.time.{created,streamed,completed}` 可直接算 TTFT/延迟/TPS
+ *   - 时间：`msg.time.{created,streamed,completed}` —— created=step 开始、
+ *     streamed=流式输出结束、completed=工具执行完；延迟可直接算，
+ *     TTFT/TPS 仍需实时首 token 计时（stream-timing.ts）
  *
  * 这里用防御式访问（必要处 as any），避免与体量巨大的生成类型强耦合；
  * 字段名以运行时为准（v1 曾出现 SDK 类型滞后）。
@@ -24,6 +26,19 @@ interface AssistantLike {
   tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } }
   cost?: number
   time?: { created?: number; streamed?: number; completed?: number }
+  /** 内容分片：只有 reasoning/tool 分片带 time.created（text 分片没有）。 */
+  content?: Array<{ type?: string; time?: { created?: number } }>
+}
+
+/**
+ * 取首个内容分片的创建时刻作为「首 token」依据。
+ * 必须是**第一个**分片：若第一个分片是 text（无 time），其后 reasoning/tool 的时间
+ * 已经晚于真正的首 token，用了会高估 TPS，宁可不用。
+ */
+function firstPartCreatedAt(m: AssistantLike): number | undefined {
+  const first = Array.isArray(m.content) ? m.content[0] : undefined
+  const t = first?.time?.created
+  return typeof t === "number" && Number.isFinite(t) && t > 0 ? t : undefined
 }
 
 /**
@@ -55,6 +70,7 @@ export function toTokenMessage(msg: unknown, sessionID: string): TokenMessage | 
     created: m.time?.created,
     streamed: m.time?.streamed,
     completed: m.time?.completed,
+    firstTokenAt: firstPartCreatedAt(m),
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "opencode-token-board",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Real-time token usage, cache analytics & performance dashboard plugin for OpenCode V2",
   "type": "module",
   "main": "./dist/server.js",
@@ -30,6 +30,10 @@
   "scripts": {
     "build": "tsc && node build.tui.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "npm run test:queries && npm run test:stats && npm run test:perf",
+    "test:queries": "esbuild scripts/test-queries.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/tw-tests/test-queries.mjs && node node_modules/.cache/tw-tests/test-queries.mjs",
+    "test:stats": "esbuild scripts/test-stats-upgrade.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/tw-tests/test-stats-upgrade.mjs && node node_modules/.cache/tw-tests/test-stats-upgrade.mjs && node node_modules/.cache/tw-tests/test-stats-upgrade.mjs --v2",
+    "test:perf": "esbuild scripts/check-perf-real.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/tw-tests/check-perf-real.mjs && node node_modules/.cache/tw-tests/check-perf-real.mjs",
     "release:check": "node ./scripts/publish-check.mjs",
     "prepublishOnly": "npm run build"
   },
