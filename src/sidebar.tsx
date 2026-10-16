@@ -241,7 +241,8 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
     void goUsageVersion()
     return props.goUsageFetcher?.data() ?? null
   })
-  const goConfigured = () => goUsage() != null
+  /** 是否已有可达的用量数据（无凭证时为 false → 显示占位提示而非整块隐藏）。 */
+  const goHasData = () => goUsage() != null
 
   const goRows = createMemo(() => {
     const iconW = 2
@@ -590,8 +591,8 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
           </box>
         </Show>
 
-        {/* ⑥ Go 套餐用量区块 */}
-        <Show when={config().sidebar.showGoUsage && goConfigured()}>
+        {/* ⑥ Go 套餐用量区块（有开关即显示；无凭证/无套餐/失败各有状态提示，不再静默隐藏） */}
+        <Show when={config().sidebar.showGoUsage}>
           <box flexDirection="column" marginTop={1}>
             <box
               flexDirection="row"
@@ -612,32 +613,41 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
 
             <Show when={!collapse().subBlocks["go-plan"]}>
               <box flexDirection="column" paddingX={1} marginTop={1}>
-                <For each={goRows().rows}>
-                  {(row, idx) => {
-                    const bucket = row.bucket
-                    const pctVal = bucket && bucket.percent >= 0 ? bucket.percent : -1
-                    const pct = pctVal >= 0 ? padPercent(pctVal) : GO_PCT_EMPTY
-                    const icon = padTail(row.icon, goRows().iconW)
-                    const avail = innerWidth() - 2
-                    const barW = Math.max(8, avail - goRows().iconW - GO_PCT_W - 3)
-                    const clampPct = pctVal >= 0 ? Math.max(0, Math.min(100, pctVal)) : 0
-                    const color = pctVal >= 0 ? goPercentColor(pctVal) : dimColor()
-                    const filled = Math.round((Math.round(clampPct) / 100) * barW)
-                    return (
-                      <text marginTop={idx() > 0 ? 1 : 0}>
-                        <span style={{ fg: mutedColor() } as any}>{icon}</span>
-                        <span style={{ fg: color } as any}>{pct}</span>
-                        <span style={{ fg: mutedColor() } as any}>{" "}</span>
-                        <span style={{ fg: color } as any}>{"█".repeat(filled)}</span>
-                        <span style={{ fg: dimColor() } as any}>{"░".repeat(Math.max(0, barW - filled))}</span>
-                      </text>
-                    )
-                  }}
-                </For>
-                <Show when={!!goUsage()?.error}>
-                  <text fg={dimColor()} marginTop={1}>
-                    {goUsage()?.error === "auth-failed" ? `🔒 ${t("goAuthFailed")}` : `⚠ ${t("goFetchFailed")}`}
-                  </text>
+                <Show when={!goHasData()}>
+                  <text fg={dimColor()}>{t("goNoCredential")}</text>
+                </Show>
+                <Show when={goHasData()}>
+                  <For each={goRows().rows}>
+                    {(row, idx) => {
+                      const bucket = row.bucket
+                      const pctVal = bucket && bucket.percent >= 0 ? bucket.percent : -1
+                      const pct = pctVal >= 0 ? padPercent(pctVal) : GO_PCT_EMPTY
+                      const icon = padTail(row.icon, goRows().iconW)
+                      const avail = innerWidth() - 2
+                      const barW = Math.max(8, avail - goRows().iconW - GO_PCT_W - 3)
+                      const clampPct = pctVal >= 0 ? Math.max(0, Math.min(100, pctVal)) : 0
+                      const color = pctVal >= 0 ? goPercentColor(pctVal) : dimColor()
+                      const filled = Math.round((Math.round(clampPct) / 100) * barW)
+                      return (
+                        <text marginTop={idx() > 0 ? 1 : 0}>
+                          <span style={{ fg: mutedColor() } as any}>{icon}</span>
+                          <span style={{ fg: color } as any}>{pct}</span>
+                          <span style={{ fg: mutedColor() } as any}>{" "}</span>
+                          <span style={{ fg: color } as any}>{"█".repeat(filled)}</span>
+                          <span style={{ fg: dimColor() } as any}>{"░".repeat(Math.max(0, barW - filled))}</span>
+                        </text>
+                      )
+                    }}
+                  </For>
+                  <Show when={!!goUsage()?.error}>
+                    <text fg={dimColor()} marginTop={1}>
+                      {goUsage()?.error === "auth-failed"
+                        ? `🔒 ${t("goAuthFailed")}`
+                        : goUsage()?.error === "no-plan"
+                          ? `🚫 ${t("goNoPlan")}`
+                          : `⚠ ${t("goFetchFailed")}`}
+                    </text>
+                  </Show>
                 </Show>
               </box>
             </Show>

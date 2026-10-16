@@ -65,12 +65,22 @@ npm install -g opencode-token-board
 
 ## Go 套餐用量（零配置）
 
-Go 用量**自动读取你已登录的 OpenCode 凭证**（通过 `client.credential.list()` 取 Console OAuth token），
+Go 用量**自动读取你已登录的 OpenCode 凭证**（通过 `client.credential.list()`），
 调用官方端点 `GET https://opencode.ai/inference/go/v1/usage`，**无需任何手填配置**。
 
-- 只要你用 `/connect` 登录过 OpenCode Console（或 Go），侧边栏即自动显示 Go 套餐的滚动(5h)/本周/本月用量
-- 数据与 <https://opencode.ai/console> 一致（百分比 + 重置倒计时）
+凭证解析优先级（兼容两类接入方式，实测两种 token 都能调通该端点）：
+
+1. `opencode-go` 集成的 **API Key**（`/connect` → `OpenCode Go` → 粘贴 API Key，多数用户）
+2. `opencode` 集成的 **Console OAuth**（`/connect` → `OpenCode` → `OpenCode Console account`）
+3. `opencode` 集成的 API Key
+
+- 侧边栏显示 Go 套餐的滚动(5h)/本周/本月用量，数据与 <https://opencode.ai/console> 一致（百分比 + 重置倒计时）
+- 无凭证时显示「无凭证 · 请用 /connect 登录」；账号没有 Go 套餐时显示「未订阅 Go 套餐」
 - V1 的「手填 Workspace ID + Cookie」与页面抓取方案已移除（V2 页面不再服务端渲染，抓取已失效）
+
+**排障**：侧边栏 Go 区块不显示或报错时，运行 `node scripts/diag-go-usage.cjs`，
+它会打印凭证来源与端点返回状态；关键失败也会写入 opencode 日志
+（`~/.local/share/opencode/log/opencode.log`，搜索 `[opencode-token-board] Go usage`）。
 
 ## 数据文件
 

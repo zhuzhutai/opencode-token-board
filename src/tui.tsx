@@ -6,7 +6,7 @@ import { registerCommands } from "./commands.js"
 import { PerfRecorder } from "./perf-tracker.js"
 import { noteStreamToken, resetStreamTiming } from "./stream-timing.js"
 import { extractTokenMessages } from "./mapper.js"
-import { createGoUsageFetcher } from "./go-usage.js"
+import { createGoUsageFetcher, pickGoToken } from "./go-usage.js"
 import type { TokenResolver } from "./go-usage.js"
 import { createBoardStorage } from "./storage.js"
 import { setLanguage, t } from "./i18n.js"
@@ -37,15 +37,28 @@ import { registerEnhancements } from "./enhancements.js"
 /** 事件触发的同步/记录去抖间隔（毫秒）。合并同一帧内的密集事件。 */
 const SYNC_DEBOUNCE_MS = 60
 
-/** 从 opencode 集成的 active OAuth 凭证取 access token（供 Go 用量 API 使用）。 */
+/**
+ * 取 Go 用量 API 的 Bearer token（供 Go 用量 API 使用）。
+ *
+ * 兼容两类用户（实测两种 token 都能调通官方 usage 端点）：
+ *   · API Key 接入：opencode-go / opencode 集成的 value.key（多数用户是这种）
+ *   · Console OAuth 接入：opencode 集成的 value.access
+ * 选择逻辑见 go-usage 的 pickGoToken（不强制 active，key 类型凭证 active 可能为 null）。
+ */
 function makeGoTokenResolver(context: Context): TokenResolver {
   return async () => {
     try {
       const creds = await context.client.credential.list()
-      const oc = creds.find((c) => c.integrationID === "opencode" && c.active)
-      if (oc?.value?.type === "oauth" && oc.value.access) return oc.value.access
-    } catch { /* 无凭证/未登录 */ }
-    return undefined
+      const token = pickGoToken(creds)
+      if (!token) {
+        const ids = (creds ?? []).map((c) => `${c.integrationID}:${c.value?.type ?? "?"}`).join(", ")
+        console.warn(`[opencode-token-board] Go usage: 未找到可用凭证（credential.list 返回 ${creds?.length ?? 0} 条${ids ? `: ${ids}` : ""}）`)
+      }
+      return token
+    } catch (e) {
+      console.warn(`[opencode-token-board] Go usage: 读取凭证失败 ${(e as Error)?.message ?? e}`)
+      return undefined
+    }
   }
 }
 

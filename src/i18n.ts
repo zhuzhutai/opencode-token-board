@@ -80,6 +80,8 @@ const zh: Record<string, string> = {
   goResetsIn: "重置于",
   goAuthFailed: "认证失败",
   goFetchFailed: "无法连接",
+  goNoPlan: "未订阅 Go 套餐",
+  goNoCredential: "无凭证 · 请用 /connect 登录",
   showGoUsage: "显示 Go 套餐用量",
   descShowGoUsage: "在侧边栏显示 OpenCode Go 订阅用量（自动读取已登录凭证，无需配置）",
 
@@ -165,6 +167,8 @@ const en: Record<string, string> = {
   goResetsIn: "Resets in",
   goAuthFailed: "Auth failed",
   goFetchFailed: "Unreachable",
+  goNoPlan: "No Go subscription",
+  goNoCredential: "No credential · use /connect",
   showGoUsage: "Show Go Plan usage",
   descShowGoUsage: "Display OpenCode Go subscription usage in sidebar (auto-reads signed-in credential, no setup)",
 

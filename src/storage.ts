@@ -38,5 +38,22 @@ export function createBoardStorage(context: Context): BoardStorage {
   const initialConfig = mergeOptionsWithDefaults(context.options ?? {})
   const [config, updateConfig] = context.storage.store<SidebarConfig>("config", { initial: initialConfig })
   const [collapse, updateCollapse] = context.storage.store<CollapseState>("collapse", { initial: DEFAULT_COLLAPSE })
+
+  // 兜底：持久化值优先于 initial，历史版本可能缺少后加的字段（如 showGoUsage），
+  // 读出来是 undefined 会被当作「关闭」而误隐藏。这里检测并回填默认值。
+  const persisted = config as Partial<SidebarConfig>
+  const sb = (persisted.sidebar ?? {}) as Partial<SidebarConfig["sidebar"]>
+  const needsFill =
+    sb.showPerformance === undefined ||
+    sb.showTokenDistribution === undefined ||
+    sb.showGoUsage === undefined ||
+    persisted.language === undefined
+  if (needsFill) {
+    updateConfig((d) => {
+      d.sidebar = { ...DEFAULT_SIDEBAR_CONFIG.sidebar, ...(d.sidebar ?? {}) }
+      if (d.language === undefined) d.language = DEFAULT_SIDEBAR_CONFIG.language
+    }).catch(() => { /* 回填失败不影响使用 */ })
+  }
+
   return { config, updateConfig, collapse, updateCollapse }
 }
