@@ -132,10 +132,12 @@ export function formatDuration(ms: number | null): string {
  *
  * @param outputTokens    可见输出 token 数
  * @param reasoningTokens 推理 token 数（与 output 同处一个流式窗口，应计入）
- * @param genMs           生成窗口时长（毫秒）。**必须与 OpenCode 官方口径一致**：
- *                        `streamed - created`（step 开始 → 流式输出结束，含预填充）。
- *                        这是历史上 TPS 冲上几千的根因所在——旧代码误用
- *                        `completed - streamed`（工具执行耗时，常 <100ms）当分母。
+ * @param genMs           生成窗口时长（毫秒）。**必须与 OpenCode 官方口径一致**（v2.3.2）：
+ *                        `streamed - (firstToken ?? created)`（首 token → 流式结束，
+ *                        **不含预填充**）。官方 footer 对整轮按 Σtoken/Σ窗口 聚合。
+ *                        历史 bug 两则：最早误用 `completed - streamed`（工具执行耗时）
+ *                        当分母，TPS 冲上几千；后改 `streamed - created`（含预填充），
+ *                        长上下文会话又系统性低估 30~70%。
  */
 export function computeTps(
   outputTokens: number,
@@ -149,7 +151,7 @@ export function computeTps(
 }
 
 /**
- * TPS 合理性上限（tok/s）。仅作兜底防线：正常情况下官方口径（streamed − created）
+ * TPS 合理性上限（tok/s）。仅作兜底防线：正常情况下官方口径（streamed − firstToken）
  * 落在大约 10~300，极少超过 1000。超过上限说明时间戳异常（窗口塌缩/时钟漂移），
  * 此时置 null，而不是把假值写进统计。
  *

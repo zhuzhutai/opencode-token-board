@@ -3,7 +3,9 @@
  *
  * 背景：旧口径 `TPS = tokens / (completed - streamed)` 中的 `completed - streamed`
  * 实际是**工具执行耗时**（无工具时常 <100ms），会算出上千 TPS 的假值。
- * 现口径与 OpenCode 官方一致：`TPS = (output + reasoning) / ((streamed - created) / 1000)`。
+ * 现口径与 OpenCode 官方一致（v2.3.2，从官方二进制反混淆核实）：
+ * `TPS = (output + reasoning) / ((streamed - (firstToken ?? created)) / 1000)`，
+ * 分母是「首 token → 流式结束」的纯流式窗口，**不含预填充（TTFT）**。
  * 本脚本把历史消息按新算法重算一遍，并与旧口径对照，输出分布用于回归校验。
  *
  * 运行（真实 DB，只读）：
@@ -55,14 +57,15 @@ const ttftAll = samples.map(s => s.ttft).filter((v): v is number => v != null)
 const overLimit = samples.filter(s => s.tps != null && s.tps > 1000)
 const overOldBug = samples.filter(s => s.tps != null && s.tps > 2000)
 
-// 官方口径恒等式：TPS 必须等于 (output+reasoning)/((streamed-created)/1000)，误差 <0.5%
+// 官方口径恒等式：TPS 必须等于 (output+reasoning)/((streamed-(firstToken??created))/1000)，误差 <0.5%
 let identityChecked = 0
 let identityBad = 0
 for (const m of msgs) {
   if (typeof m.streamed !== "number" || typeof m.created !== "number" || typeof m.completed !== "number") continue
   const { tps } = derivePerf(m)
   if (tps == null) continue
-  const official = ((m.outputTokens + m.reasoningTokens) / ((m.streamed - m.created) / 1000))
+  const start = typeof m.firstTokenAt === "number" ? m.firstTokenAt : m.created
+  const official = ((m.outputTokens + m.reasoningTokens) / ((m.streamed - start) / 1000))
   identityChecked++
   if (Math.abs(tps - official) / official > 0.005) identityBad++
 }

@@ -61,21 +61,24 @@ export interface PerfSample {
  *
  * 时间字段真实语义（与 OpenCode core 对齐，勿按字段名望文生义）：
  *   created   = step 开始（发请求）
+ *   firstToken= 首个 token 到达（v2.3.x 官方 time.firstToken，session.step.first-token）
  *   streamed  = 流式输出结束（session.step.streamed，在流跑完后 publish）
  *   completed = step 收尾（工具执行完）
  *
- * ── TPS：严格对齐 OpenCode 官方口径 ──
- * 官方源码（v2.0.29 TUI footer）：
- *   TPS = Σ(output + reasoning) / (Σ(streamed − created) / 1000)
- * 即「step 开始 → 流式结束」为生成窗口（含预填充）。逐条消息等价于
- *   (output + reasoning) / ((streamed − created) / 1000)
- * 历史 bug：旧代码误用 `completed − streamed`（工具执行耗时，常 <100ms）当分母，
- * 于是 TPS 动辄上千（实测 avg 1150、max 26000），而官方只有几十~两百。
+ * ── TPS：严格对齐 OpenCode 官方口径（v2.3.2 TUI footer，从官方二进制反混淆核实）──
+ *   TPS = Σ(output + reasoning) / (Σ(streamed − (firstToken ?? created)) / 1000)
+ * 分母是「首个 token → 流式结束」的**纯流式窗口，不含预填充（TTFT）**。
+ * 逐条消息等价于 (output + reasoning) / ((streamed − firstToken) / 1000)。
+ * 历史 bug 两则：
+ *   · 旧代码误用 `completed − streamed`（工具执行耗时，常 <100ms）当分母，
+ *     TPS 动辄上千；
+ *   · 后改为 `streamed − created`（含预填充），在长上下文会话里系统性低估
+ *     30~70%（v2.3.2 官方已改用 firstToken 起点，本实现随之对齐）。
  *
  * ── TTFT：首 token − step 开始（官方不展示）──
  * 首 token 时间来源（按优先级）：
  *   ① stream-timing.ts 实时采集的首个 delta
- *   ② 消息首个内容分片的 time.created（reasoning/tool 开头的消息可用）
+ *   ② 消息持久化的 time.firstToken（core v2.3.x）/ 首个内容分片的 time.created
  *   ③ 都没有 → TTFT 置 null（宁缺毋滥）
  */
 export function derivePerf(m: TokenMessage): PerfSample {
@@ -84,15 +87,19 @@ export function derivePerf(m: TokenMessage): PerfSample {
   const completed = m.completed!
   const latency = completed - created
 
-  // TPS —— 官方口径：生成窗口 = streamed − created（含预填充）
+  // TPS —— 官方口径（v2.3.2）：生成窗口 = streamed − (firstToken ?? created)，不含预填充
   const streamEnd = typeof m.streamed === "number" && m.streamed > 0 ? m.streamed : null
   let tps: number | null = null
-  if (streamEnd !== null && streamEnd > created) {
-    const t = computeTps(m.outputTokens, m.reasoningTokens, streamEnd - created)
-    if (t !== null && t <= MAX_PLAUSIBLE_TPS_OBSERVED) tps = t
+  if (streamEnd !== null) {
+    const windowStart = typeof m.firstTokenAt === "number" && m.firstTokenAt > 0 ? m.firstTokenAt : created
+    const genMs = Math.max(0, streamEnd - windowStart)
+    if (genMs > 0) {
+      const t = computeTps(m.outputTokens, m.reasoningTokens, genMs)
+      if (t !== null && t <= MAX_PLAUSIBLE_TPS_OBSERVED) tps = t
+    }
   }
 
-  // TTFT —— 首 token − step 开始（实时采集优先，其次首个内容分片）
+  // TTFT —— 首 token − step 开始（实时采集优先，其次持久化的 firstToken / 内容分片）
   const live = getStreamTiming(m.id)
   let first: number | null = null
   if (live && live.first >= created) first = live.first
@@ -104,6 +111,44 @@ export function derivePerf(m: TokenMessage): PerfSample {
     basis = first === null ? "approx" : live && first === live.first ? "live" : "content"
   }
   return { ttft, latency, tps, basis }
+}
+
+/**
+ * 官方 ju()：本轮 TPS = Σ(output + reasoning) / (Σ(streamed − (firstToken ?? created)) / 1000)。
+ * 「本轮」由 mapper.sliceTurn 按官方 qu()/vl() 切出（一条 user 指令触发的整轮
+ * agent loop 的全部 step）。与官方 footer 的 `· NNN.N tok/s` 同一口径，两处数字一致。
+ *
+ * 与官方一致的隐藏规则：任一步缺 time.streamed（正在流式/失败）→ 返回 null，
+ * 官方此时同样整体隐藏而不是显示部分值。
+ */
+export function computeTurnTps(turn: readonly TokenMessage[]): number | null {
+  if (turn.length === 0) return null
+  let tokens = 0
+  let ms = 0
+  for (const m of turn) {
+    if (typeof m.streamed !== "number") return null
+    tokens += m.outputTokens + m.reasoningTokens
+    const start = typeof m.firstTokenAt === "number" && Number.isFinite(m.firstTokenAt)
+      ? m.firstTokenAt
+      : m.created
+    if (typeof start !== "number" || !Number.isFinite(start)) return null
+    ms += Math.max(0, m.streamed - start)
+  }
+  if (tokens <= 0 || ms <= 0) return null
+  const tps = (tokens / ms) * 1000
+  return tps <= MAX_PLAUSIBLE_TPS_OBSERVED ? tps : null
+}
+
+/**
+ * 官方 Bu()：本轮时长 = 锚点消息 completed − 边界消息 created
+ * （无边界消息时用锚点自身 created）。含本轮全部工具执行时间，
+ * 即官方 footer 里 `5m 1s · 249.8 tok/s` 的 `5m 1s`。
+ */
+export function computeTurnDuration(current: TokenMessage, startedAt?: number): number | null {
+  if (typeof current.completed !== "number") return null
+  const start = typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : current.created
+  if (typeof start !== "number" || !Number.isFinite(start)) return null
+  return Math.max(0, current.completed - start)
 }
 
 /**

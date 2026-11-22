@@ -4,8 +4,9 @@ import type { Context } from "@opencode/plugin/tui/context"
 import { RGBA } from "@opentui/core"
 import { formatTokens, formatCost, formatDuration } from "./formatter.js"
 import { t as baseT, setLanguage } from "./i18n.js"
-import { computePerfStats } from "./perf-tracker.js"
-import { extractTokenMessages } from "./mapper.js"
+import { computePerfStats, computeTurnTps, computeTurnDuration, derivePerf } from "./perf-tracker.js"
+import { extractTokenMessages, sliceTurn } from "./mapper.js"
+import { BUILD_TAG } from "./types.js"
 import type { GoUsageFetcher } from "./go-usage.js"
 import type { BoardStorage } from "./storage.js"
 import type { TokenMessage, SidebarConfig, CollapseState } from "./types.js"
@@ -28,7 +29,7 @@ import type { TokenMessage, SidebarConfig, CollapseState } from "./types.js"
  *
  *  ── 渲染出的终端效果（当前布局）────────────────────────────────
  *  ╭────────────────────────────────────────╮
- *  │ ▾      OpenCode-Token-Board            │  ← ① 面板标题行（accent 强调色，居中；点击折叠 ②以下）
+ *  │ ▾ OpenCode-Token-Board (1122)          │  ← ① 面板标题行（accent 强调色，居左；括号=打包标识 BUILD_TAG；点击折叠 ②以下）
  *  │    12.3K   ×45    $0.04  89.1%         │  ← ① 四项总计居中：总计|请求|花费|命中（4色）
  *  │     总计  请求    花费   命中           │  ← ① 四项标签居中（暗色）
  *  │           9.2K  3.1K                   │  ← ② 输入(蓝) / 输出(紫) 居中（折叠时隐藏）
@@ -36,7 +37,7 @@ import type { TokenMessage, SidebarConfig, CollapseState } from "./types.js"
  *  │ ▾ opencode    deepseek-v4-flash       │  ← ③ 模型头行1：▾(折叠三角) 供应商 模型名
  *  │    1.2M  ×45  $0.04  89.1%             │  ← ③ 模型头行2：四统计均分居中（配色同①）
  *  │   ╭────────────────────────╮           │
- *  │   │   1.2s  45.3   12S     │           │  ← ④ 性能网格：TTFT / TPS / 延迟
+ *  │   │   3.4s  249.8  5m 1s  │           │  ← ④ 性能网格：TTFT / TPS / 延迟（本轮官方口径）
  *  │   │   TTFT  TPS   延迟     │           │
  *  │   ╰────────────────────────╯           │
  *  │ ▾ Token分布                            │  ← ⑤ Token 分布
@@ -327,6 +328,29 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
 
   const perfStats = createMemo(() => computePerfStats(tokenMessages()))
 
+  // ── 本轮（官方 turn 口径）性能：TTFT=最新完成 step 的首字延迟，
+  //    TPS=官方 ju 聚合 Σtoken/Σ流式窗口，时长=官方 Bu（completed−本轮边界 created）──
+  //    锚点 = 该模型最后一条已 streamed 的消息（官方对未完成消息不显示 TPS，
+  //    缺省锚点即「最近一个可见 footer」的口径）。无平均值。
+  const turnPerfByModel = createMemo(() => {
+    const anchors = new Map<string, TokenMessage>()
+    for (const m of tokenMessages()) {
+      if (typeof m.streamed !== "number") continue
+      anchors.set(`${m.providerID}/${m.modelID}`, m) // 后写覆盖 → 该模型最后一条已 streamed
+    }
+    const raw = rawMessages()
+    const out = new Map<string, { ttft: number | null; tps: number | null; duration: number | null }>()
+    for (const [key, anchor] of anchors) {
+      const slice = sliceTurn(raw, props.sessionID, anchor.id)
+      out.set(key, {
+        ttft: derivePerf(anchor).ttft,
+        tps: slice ? computeTurnTps(slice.turn) : null,
+        duration: slice ? computeTurnDuration(anchor, slice.startedAt) : null,
+      })
+    }
+    return out
+  })
+
   const tokenDistribution = createMemo(() => {
     const dist: Record<string, number> = {}
     try {
@@ -407,17 +431,15 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
       borderColor={borderColor()}
     >
 
-      {/* ① 面板标题行（永远显示） */}
+      {/* ① 面板标题行（永远显示；居左，括号内为打包标识，便于确认实际加载的产物版本） */}
       <box
         flexDirection="row"
-        justifyContent="space-between"
         paddingX={1}
         marginBottom={1}
         onMouseDown={toggle.global}
       >
-        <text fg={mutedColor()}>{collapse().global ? "▶" : "▾"}</text>
-        <text fg={accentColor()}>{t("panelTitle")}</text>
-        <text fg={mutedColor()}>{" "}</text>
+        <text fg={mutedColor()}>{collapse().global ? "▶ " : "▾ "}</text>
+        <text fg={accentColor()}>{t("panelTitle")} ({BUILD_TAG})</text>
       </box>
 
       {/* ① 四项总计（永远显示） */}
@@ -530,9 +552,9 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
                       >
                         <box flexDirection="row">
                           <For each={[
-                            { val: formatDuration(perfStats().models[key]?.avgTTFT ?? null), lbl: t("ttft"), rw: 6 },
-                            { val: perfStats().models[key]?.avgTPS?.toFixed(1) ?? "—", lbl: t("tps"), rw: 6 },
-                            { val: formatDuration(perfStats().models[key]?.avgLatency ?? null), lbl: t("latency"), rw: 6 },
+                            { val: formatDuration(turnPerfByModel().get(key)?.ttft ?? null), lbl: t("ttft"), rw: 6 },
+                            { val: turnPerfByModel().get(key)?.tps?.toFixed(1) ?? "—", lbl: t("tps"), rw: 6 },
+                            { val: formatDuration(turnPerfByModel().get(key)?.duration ?? null), lbl: t("latency"), rw: 6 },
                           ]}>
                             {(item, idx) => {
                               const colW = () => {

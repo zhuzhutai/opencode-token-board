@@ -12,6 +12,7 @@ import { createBoardStorage } from "./storage.js"
 import { setLanguage, t } from "./i18n.js"
 import { TokenWatchPanel } from "./sidebar.js"
 import { registerEnhancements } from "./enhancements.js"
+import { registerFooterTps } from "./footer-tps.js"
 
 /**
  * ══════════════════════════════════════════════════════════════════
@@ -141,6 +142,9 @@ export default Plugin.define({
 
     // ── 增强（阶段 7）：状态条 / 全屏面板 / 仪表盘路由 ──
     cleanups.push(registerEnhancements(context, storage, version))
+
+    // ── 底部状态栏 TPS（prompt.footer.status 槽，step 结束时刷新，见 footer-tps.tsx）──
+    cleanups.push(registerFooterTps(context))
 
     // ── 侧边栏槽位 ──
     cleanups.push(context.ui.slot({
