@@ -8,6 +8,7 @@ import { computePerfStats, computeTurnTps, computeTurnDuration, derivePerf } fro
 import { extractTokenMessages, sliceTurn } from "./mapper.js"
 import { BUILD_TAG } from "./types.js"
 import type { GoUsageFetcher } from "./go-usage.js"
+import type { CommandCodeUsageFetcher } from "./commandcode-usage.js"
 import type { BoardStorage } from "./storage.js"
 import type { TokenMessage, SidebarConfig, CollapseState } from "./types.js"
 
@@ -44,6 +45,8 @@ import type { TokenMessage, SidebarConfig, CollapseState } from "./types.js"
  *  │   █ 系统提示  1.2K                     │
  *  │ ▾ Go 套餐   8%|3h  8%|5d  11%|26d     │  ← ⑥ Go 套餐
  *  │   🕔  8% ████░░░░░░░░░░░░░            │
+ *  │ ▾ CommandCode GOAT      $17.30 · 9d   │  ← ⑦ CommandCode 套餐 / 余额
+ *  │   🕔  1% █░░░░░░░░░░░░░░░            │
  *  ╰────────────────────────────────────────╯
  *  配色语义：标题=accent，主数值/模型名=primary，请求数/输出=purple，输入=blue，
  *          花费=green，命中=hitColor(黄)，标签/次要=muted。
@@ -145,6 +148,18 @@ function goPercentColor(percent: number): RGBA {
   return RGBA.fromInts(63, 185, 80, 255)
 }
 
+/** CommandCode 余额配色：>= $10 绿，$3–$10 黄，< $3 红（只变色，不弹提示）。 */
+function balanceColor(remaining: number): RGBA {
+  if (remaining < 3) return RGBA.fromInts(244, 67, 54, 255)
+  if (remaining < 10) return RGBA.fromInts(255, 193, 7, 255)
+  return RGBA.fromInts(63, 185, 80, 255)
+}
+
+/** 金额固定两位小数：17.3038 → $17.30 */
+function formatCredits(value: number): string {
+  return `$${value.toFixed(2)}`
+}
+
 /** 重置倒计时短格式 */
 function formatResetShort(sec: number): string {
   if (!sec || sec <= 0) return ""
@@ -187,6 +202,7 @@ interface TokenWatchPanelProps {
   /** 版本信号访问器：每次消息同步 +1，驱动 memo 重读 message.list */
   version: () => number
   goUsageFetcher?: GoUsageFetcher
+  commandCodeUsageFetcher?: CommandCodeUsageFetcher
 }
 
 export function TokenWatchPanel(props: TokenWatchPanelProps) {
@@ -222,6 +238,13 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
   // 配置变化 → 同步语言（响应式，无轮询）。Go 用量不再依赖手填配置（凭证自动读）。
   createEffect(() => {
     setLanguage(config().language)
+  })
+
+  // CommandCode 显式 API Key 变更 → 同步到 fetcher（空字符串 = 恢复自动发现）。
+  // setConfig 内部对相同值去重，不会造成重复刷新。
+  createEffect(() => {
+    const key = config().commandcode?.apiKey ?? ""
+    props.commandCodeUsageFetcher?.setConfig(key)
   })
 
   // ── 面板宽度常量（写死 opencode 侧边栏，不做动态测量）──
@@ -272,6 +295,50 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
     const titleW = getVisualWidth(`${collapse().subBlocks["go-plan"] ? "▶" : "▾"} ${t("goPlan")}`)
     const maxW = Math.max(4, innerWidth() - 2 - titleW - 1)
     return truncateTail(s, maxW)
+  })
+
+  // ── CommandCode 套餐用量与余额 ──
+  const [ccVersion, setCcVersion] = createSignal(0)
+  onMount(() => {
+    const unsub = props.commandCodeUsageFetcher?.subscribe(() => setCcVersion(v => v + 1))
+    onCleanup(() => { try { unsub?.() } catch { } })
+  })
+  const ccUsage = createMemo(() => {
+    void ccVersion()
+    return props.commandCodeUsageFetcher?.data() ?? null
+  })
+  /** 是否已解析到可用 Key：没有 Key 时整块不渲染（不打扰未使用 CommandCode 的用户）。 */
+  const ccConfigured = () => {
+    void ccVersion()
+    return props.commandCodeUsageFetcher?.configured() ?? false
+  }
+  /** 套餐名（自动识别）：GOAT / Pro / Max …；未知或与产品名重复时留空。 */
+  const ccPlanLabel = createMemo(() => {
+    const usage = ccUsage()
+    if (!usage || usage.error) return ""
+    const name = usage.planName || ""
+    if (!name || name === "CommandCode") return ""
+    return truncateTail(name, 6)
+  })
+  /** 标题右侧：余额 + 续费天数。 */
+  const ccBalanceText = createMemo(() => {
+    const usage = ccUsage()
+    if (!usage || usage.error) return ""
+    const days = usage.periodEndInSec > 0 ? Math.ceil(usage.periodEndInSec / 86400) : 0
+    const text = days > 0 ? `${formatCredits(usage.totalRemaining)} · ${days}d` : formatCredits(usage.totalRemaining)
+    return truncateTail(text, 13)
+  })
+  const ccRows = createMemo(() => {
+    const usage = ccUsage()
+    if (!usage) return { rows: [] as { icon: string; bucket: { percent: number } | null }[], iconW: 2 }
+    return {
+      iconW: 2,
+      rows: [
+        { icon: "🕔", bucket: usage.fiveHour },
+        { icon: "📅", bucket: usage.weekly },
+        { icon: "💰", bucket: { percent: usage.usagePercent } },
+      ],
+    }
   })
 
   // ── 颜色 helpers（v1 扁平键 → v2 ResolvedTheme 语义 token，带硬编码兜底）──
@@ -670,6 +737,71 @@ export function TokenWatchPanel(props: TokenWatchPanelProps) {
                           : `⚠ ${t("goFetchFailed")}`}
                     </text>
                   </Show>
+                </Show>
+              </box>
+            </Show>
+          </box>
+        </Show>
+
+        {/* ⑦ CommandCode 套餐用量 / 余额（自动识别套餐；无 Key 时整块不显示） */}
+        <Show when={config().sidebar.showCommandCodeUsage && ccConfigured()}>
+          <box flexDirection="column" marginTop={1}>
+            <box
+              flexDirection="row"
+              justifyContent="space-between"
+              onMouseDown={() => {
+                toggle.sub("cc-plan")
+                props.commandCodeUsageFetcher?.refresh(true)
+              }}
+              paddingX={1}
+            >
+              <text fg={greenColor()}>
+                {`${!collapse().subBlocks["cc-plan"] ? "▾" : "▶"} CommandCode${ccPlanLabel() ? ` ${ccPlanLabel()}` : ""}`}
+              </text>
+              <Show when={!!ccBalanceText()}>
+                <text fg={balanceColor(ccUsage()?.totalRemaining ?? 0)}>
+                  {ccBalanceText()}
+                </text>
+              </Show>
+            </box>
+
+            <Show when={!collapse().subBlocks["cc-plan"]}>
+              <box flexDirection="column" paddingX={1} marginTop={1}>
+                <Show when={ccUsage() && !ccUsage()!.error}>
+                  <For each={ccRows().rows}>
+                    {(row, idx) => {
+                      const bucket = row.bucket
+                      const pctVal = bucket && bucket.percent >= 0 ? bucket.percent : -1
+                      const pct = pctVal >= 0 ? padPercent(pctVal) : GO_PCT_EMPTY
+                      const icon = padTail(row.icon, ccRows().iconW)
+                      const avail = innerWidth() - 2
+                      const barW = Math.max(8, avail - ccRows().iconW - GO_PCT_W - 3)
+                      const clampPct = pctVal >= 0 ? Math.max(0, Math.min(100, pctVal)) : 0
+                      const color = pctVal >= 0 ? goPercentColor(pctVal) : dimColor()
+                      const filled = Math.round((Math.round(clampPct) / 100) * barW)
+                      return (
+                        <text marginTop={idx() > 0 ? 1 : 0}>
+                          <span style={{ fg: mutedColor() } as any}>{icon}</span>
+                          <span style={{ fg: color } as any}>{pct}</span>
+                          <span style={{ fg: mutedColor() } as any}>{" "}</span>
+                          <span style={{ fg: color } as any}>{"█".repeat(filled)}</span>
+                          <span style={{ fg: dimColor() } as any}>{"░".repeat(Math.max(0, barW - filled))}</span>
+                        </text>
+                      )
+                    }}
+                  </For>
+                </Show>
+                <Show when={!ccUsage()}>
+                  <text fg={dimColor()}>…</text>
+                </Show>
+                <Show when={!!ccUsage()?.error}>
+                  <text fg={dimColor()}>
+                    {ccUsage()?.error === "auth-failed"
+                      ? `🔒 ${t("ccAuthFailed")}`
+                      : ccUsage()?.error === "no-plan"
+                        ? `🚫 ${t("ccNoPlan")}`
+                        : `⚠ ${t("ccFetchFailed")}`}
+                  </text>
                 </Show>
               </box>
             </Show>

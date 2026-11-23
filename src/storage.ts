@@ -31,6 +31,7 @@ function mergeOptionsWithDefaults(options: Readonly<Record<string, any>>): Sideb
   return {
     sidebar: { ...DEFAULT_SIDEBAR_CONFIG.sidebar, ...(opts?.sidebar ?? {}) },
     language: opts?.language ?? DEFAULT_SIDEBAR_CONFIG.language,
+    commandcode: opts?.commandcode ? { ...opts.commandcode } : undefined,
   }
 }
 
@@ -47,6 +48,7 @@ export function createBoardStorage(context: Context): BoardStorage {
     sb.showPerformance === undefined ||
     sb.showTokenDistribution === undefined ||
     sb.showGoUsage === undefined ||
+    sb.showCommandCodeUsage === undefined ||
     persisted.language === undefined
   if (needsFill) {
     updateConfig((d) => {

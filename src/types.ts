@@ -14,7 +14,7 @@
  * 用于直观确认 OpenCode 实际加载的是哪一版产物（OpenCode 从自己的
  * npm 缓存目录加载插件，版本不可见，故用此标记自证）。
  */
-export const BUILD_TAG = "1122"
+export const BUILD_TAG = "1123"
 
 export interface TokenMessage {
   id: string
@@ -46,12 +46,20 @@ export interface SidebarConfig {
     showPerformance: boolean
     showTokenDistribution: boolean
     showGoUsage: boolean
+    showCommandCodeUsage: boolean
   }
   language: "zh" | "en" | "auto"
+  /** CommandCode 用量查询：手填 API Key（留空 = 自动读取凭据 / 环境变量 / opencode 配置）。 */
+  commandcode?: { apiKey?: string }
 }
 
 export const DEFAULT_SIDEBAR_CONFIG: SidebarConfig = {
-  sidebar: { showPerformance: true, showTokenDistribution: true, showGoUsage: true },
+  sidebar: {
+    showPerformance: true,
+    showTokenDistribution: true,
+    showGoUsage: true,
+    showCommandCodeUsage: true,
+  },
   language: "auto",
 }
 

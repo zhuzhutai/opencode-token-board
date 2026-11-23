@@ -193,11 +193,37 @@ async function showLanguageMenu(context: Context, storage: BoardStorage): Promis
   }
 }
 
+async function showCommandCodeKeyMenu(context: Context, storage: BoardStorage): Promise<void> {
+  const current = storage.config.commandcode?.apiKey ?? ""
+  const choice = await context.ui.dialog.select<"set" | "clear" | "back">({
+    title: t("ccApiKeyTitle"),
+    options: [
+      { title: `${current ? "✓ " : "  "}${t("ccSetApiKey")}`, value: "set", description: t("ccApiKeyHint") },
+      { title: t("ccClearApiKey"), value: "clear" },
+      { title: t("done"), value: "back" },
+    ],
+  })
+  if (choice === "set") {
+    const value = await context.ui.dialog.prompt({
+      title: t("ccSetApiKey"),
+      description: t("ccApiKeyHint"),
+      placeholder: "user_...",
+      value: current,
+    })
+    if (value !== undefined) {
+      const trimmed = value.trim()
+      await storage.updateConfig((d) => { d.commandcode = { ...(d.commandcode ?? {}), apiKey: trimmed } })
+    }
+  } else if (choice === "clear") {
+    await storage.updateConfig((d) => { d.commandcode = { ...(d.commandcode ?? {}), apiKey: "" } })
+  }
+}
+
 async function showSettingsMenu(context: Context, storage: BoardStorage): Promise<void> {
   for (;;) {
     const cfg = storage.config
     const choice = await context.ui.dialog.select<
-      "showPerformance" | "showTokenDistribution" | "showGoUsage" | "language" | "done"
+      "showPerformance" | "showTokenDistribution" | "showGoUsage" | "showCommandCodeUsage" | "commandCodeKey" | "language" | "done"
     >({
       title: t("settingsTitle"),
       placeholder: t("settingsPlaceholder"),
@@ -205,6 +231,8 @@ async function showSettingsMenu(context: Context, storage: BoardStorage): Promis
         { title: `${cfg.sidebar.showPerformance ? "✓ " : "  "}${t("showPerformance")}`, value: "showPerformance", description: t("descShowPerformance") },
         { title: `${cfg.sidebar.showTokenDistribution ? "✓ " : "  "}${t("showTokenDistribution")}`, value: "showTokenDistribution", description: t("descShowTokenDistribution") },
         { title: `${cfg.sidebar.showGoUsage ? "✓ " : "  "}${t("showGoUsage")}`, value: "showGoUsage", description: t("descShowGoUsage") },
+        { title: `${cfg.sidebar.showCommandCodeUsage ? "✓ " : "  "}${t("showCommandCodeUsage")}`, value: "showCommandCodeUsage", description: t("descShowCommandCodeUsage") },
+        { title: `${t("ccApiKeyTitle")} ▸`, value: "commandCodeKey", description: t("ccApiKeyHint") },
         { title: `${t("settingsLanguage")} ▸`, value: "language", description: t("descSettingsLanguage") },
         { title: t("done"), value: "done", description: t("closeSettings") },
       ],
@@ -212,6 +240,8 @@ async function showSettingsMenu(context: Context, storage: BoardStorage): Promis
     if (choice === "showPerformance") await storage.updateConfig((d) => { d.sidebar.showPerformance = !d.sidebar.showPerformance })
     else if (choice === "showTokenDistribution") await storage.updateConfig((d) => { d.sidebar.showTokenDistribution = !d.sidebar.showTokenDistribution })
     else if (choice === "showGoUsage") await storage.updateConfig((d) => { d.sidebar.showGoUsage = !d.sidebar.showGoUsage })
+    else if (choice === "showCommandCodeUsage") await storage.updateConfig((d) => { d.sidebar.showCommandCodeUsage = !d.sidebar.showCommandCodeUsage })
+    else if (choice === "commandCodeKey") await showCommandCodeKeyMenu(context, storage)
     else if (choice === "language") await showLanguageMenu(context, storage)
     else return
   }

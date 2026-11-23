@@ -583,3 +583,39 @@ export interface GoUsageData {
   fetchedAt: number
   error?: string
 }
+
+// ── CommandCode 订阅用量（GOAT / Pro / Max …）──
+
+/** 带金额上限的用量窗口（5 小时 / 本周），金额单位美元。 */
+export interface CommandCodeBucket {
+  used: number
+  cap: number
+  /** 已用百分比（cap<=0 时为 -1） */
+  percent: number
+  resetInSec: number
+}
+
+export interface CommandCodeUsageData {
+  /** API 原始套餐 ID，如 individual-goat */
+  planId: string
+  /** 展示名，如 GOAT / Pro / Max */
+  planName: string
+  /** 该套餐月额度（美元），无法识别套餐时为 null */
+  planMonthlyCredits: number | null
+  status: string
+  /** 距本计费周期结束的秒数 */
+  periodEndInSec: number
+  monthlyRemaining: number
+  purchasedRemaining: number
+  freeRemaining: number
+  /** 月额度 + 购买 + 赠送，当前剩余总额 */
+  totalRemaining: number
+  /** 本周期已花费（美元） */
+  totalSpent: number
+  /** 本周期额度使用百分比（0-100） */
+  usagePercent: number
+  fiveHour: CommandCodeBucket
+  weekly: CommandCodeBucket
+  fetchedAt: number
+  error?: string
+}

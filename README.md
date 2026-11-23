@@ -11,6 +11,7 @@ A live sidebar dashboard for the OpenCode V2 TUI that lets you **see** your toke
 - 🚀 **性能指标** — TTFT / TPS / 延迟 + P50/P95/P99 分位数，追踪模型响应速度 / TTFT, TPS, latency with percentiles
 - 📈 **报告导出** — HTML / JSON / Markdown / CSV 一键生成，数据落盘 `~/.opencode/reports/` / One-click HTML/JSON/Markdown/CSV reports
 - 💰 **Go 余额查询** — 自动读取已登录凭证，展示 Go 套餐滚动/本周/月用量，零配置 / Auto Go plan usage (zero-config, reads your signed-in credential)
+- 🐐 **CommandCode 套餐余额** — 自动识别 GOAT / Pro / Max 套餐，展示 5h/本周用量、月余额与续费倒计时 / Auto CommandCode plan & balance (GOAT, Pro, Max…)
 - 🔔 **原生完成通知** — 会话结束用 OpenCode V2 内置 attention 发系统通知 + 音效 / Native completion notification via OpenCode V2 attention
 
 本项目基于 [opencode-token-watch](https://github.com/Howardzhangdqs/opencode-token-watch) 修改而来，特此鸣谢原项目作者。
@@ -81,6 +82,32 @@ Go 用量**自动读取你已登录的 OpenCode 凭证**（通过 `client.creden
 **排障**：侧边栏 Go 区块不显示或报错时，运行 `node scripts/diag-go-usage.cjs`，
 它会打印凭证来源与端点返回状态；关键失败也会写入 opencode 日志
 （`~/.local/share/opencode/log/opencode.log`，搜索 `[opencode-token-board] Go usage`）。
+
+## CommandCode 套餐用量与余额（零配置）
+
+侧边栏会**自动识别你正在使用的 CommandCode 套餐**（GOAT / Pro / Max / Ultra / Teams Pro…），
+展示 5 小时/本周窗口用量、月余额与续费倒计时，数据与 Command Code 官方 `/usage` 面板一致。
+
+- 套餐名与月额度来自 `GET /alpha/billing/subscriptions` 的 `planId`（如 `individual-goat` → **GOAT**）
+- 余额取 `monthlyCredits + purchasedCredits + freeCredits`，低于 $10 变黄、低于 $3 变红（只变色，不弹提示）
+- 5h / 本周的额度上限以接口返回为准（会随模型与活动变化，不写死）
+
+API Key 解析优先级（任一命中即可，**无需手填**）：
+
+1. opencode 凭证库中集成 ID 含 `commandcode` 的 Key（用 `opencode auth` 登录过时）
+2. 环境变量 `commandcode_key` / `COMMANDCODE_API_KEY`（`opencode.jsonc` 里 `{env:commandcode_key}` 就是这种）
+3. `~/.local/share/opencode/auth.json` 的 `commandcode`
+4. `~/.config/opencode/opencode.json[c]` 的 `provider.commandcode.options.apiKey`（支持 `{env:VAR}`）
+
+> 检测不到 Key 时该区块**整块不显示**，不会干扰只用 OpenCode Go 的用户。
+> Command Code 的 **Go 计划没有 API 权限**（仅 GOAT 及以上可查），此时会显示「该套餐不支持 API 查询」。
+
+可在 `/usage` → 设置里：
+- 关闭「显示 CommandCode 用量」
+- 手动设置 CommandCode API Key（留空则继续自动识别）
+
+**排障**：运行 `node scripts/diag-commandcode-usage.cjs` 打印 Key 来源与四个接口的返回状态；
+关键失败写入 opencode 日志（搜索 `[opencode-token-board] CommandCode usage`）。
 
 ## 数据文件
 

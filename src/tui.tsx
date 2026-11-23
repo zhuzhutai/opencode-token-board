@@ -8,6 +8,8 @@ import { noteStreamToken, resetStreamTiming } from "./stream-timing.js"
 import { extractTokenMessages } from "./mapper.js"
 import { createGoUsageFetcher, pickGoToken } from "./go-usage.js"
 import type { TokenResolver } from "./go-usage.js"
+import { createCommandCodeUsageFetcher, discoverCommandCodeKey, pickCommandCodeToken } from "./commandcode-usage.js"
+import type { CommandCodeTokenResolver } from "./commandcode-usage.js"
 import { createBoardStorage } from "./storage.js"
 import { setLanguage, t } from "./i18n.js"
 import { TokenWatchPanel } from "./sidebar.js"
@@ -46,8 +48,7 @@ const SYNC_DEBOUNCE_MS = 60
  *   · Console OAuth 接入：opencode 集成的 value.access
  * 选择逻辑见 go-usage 的 pickGoToken（不强制 active，key 类型凭证 active 可能为 null）。
  */
-function makeGoTokenResolver(context: Context): TokenResolver {
-  return async () => {
+function makeGoTokenResolver(context: Context): TokenResolver {  return async () => {
     try {
       const creds = await context.client.credential.list()
       const token = pickGoToken(creds)
@@ -63,12 +64,37 @@ function makeGoTokenResolver(context: Context): TokenResolver {
   }
 }
 
+/**
+ * 取 CommandCode 用量 API 的 Bearer token。
+ *
+ * 解析顺序：
+ *   ① opencode 凭证库中 integrationID 含 commandcode 的 key（用户若用 opencode auth 登录过）
+ *   ② 环境变量 / auth.json / opencode.json[c] 的自动发现（见 commandcode-usage.ts）
+ * 显式配置（设置菜单里手填）由 fetcher.setConfig 优先处理，不经过这里。
+ */
+function makeCommandCodeTokenResolver(context: Context): CommandCodeTokenResolver {
+  return async () => {
+    try {
+      const creds = await context.client.credential.list()
+      const token = pickCommandCodeToken(creds as any)
+      if (token) return token
+    } catch (e) {
+      console.warn(`[opencode-token-board] CommandCode usage: 读取凭证失败 ${(e as Error)?.message ?? e}`)
+    }
+    return discoverCommandCodeKey()
+  }
+}
+
 export default Plugin.define({
   id: "opencode-token-board",
   async setup(context) {
     const perfRecorder = new PerfRecorder()
     const goUsageFetcher = createGoUsageFetcher(makeGoTokenResolver(context))
     const storage = createBoardStorage(context)
+    const commandCodeUsageFetcher = createCommandCodeUsageFetcher(
+      makeCommandCodeTokenResolver(context),
+      storage.config.commandcode?.apiKey ?? "",
+    )
     const cleanups: (() => void)[] = []
 
     // 同步语言（侧边栏首帧即用正确语言）
@@ -122,11 +148,13 @@ export default Plugin.define({
     cleanups.push(context.data.on("session.execution.succeeded", (e) => {
       if (e.data.sessionID === currentSessionID) bump()
       goUsageFetcher.refresh()
+      commandCodeUsageFetcher.refresh()
     }))
-    // 会话空闲 → 刷新 Go 用量 + 原生通知 + 音效
+    // 会话空闲 → 刷新套餐用量 + 原生通知 + 音效
     cleanups.push(context.data.on("session.idle", async (e) => {
       if (e.data.sessionID === currentSessionID) bump()
       goUsageFetcher.refresh(true)
+      commandCodeUsageFetcher.refresh(true)
       try {
         await context.attention.notify({
           title: t("notifySessionIdleTitle"),
@@ -161,6 +189,7 @@ export default Plugin.define({
             sessionID={sessionID}
             version={version}
             goUsageFetcher={goUsageFetcher}
+            commandCodeUsageFetcher={commandCodeUsageFetcher}
           />
         )
       },
